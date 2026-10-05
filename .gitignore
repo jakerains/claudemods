@@ -1,0 +1,13 @@
+# Written by Claude Code each time it loads a mod.
+*/.claude-plugin/types/
+*/tsconfig.json
+.DS_Store
+
+# Local only: personal workshop notes, scripts and mods not published here.
+CLAUDE.md
+dev
+ship
+where-we-are/
+_parked/
+.mcp-use/
+.claude/

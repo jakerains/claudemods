@@ -1,0 +1,22 @@
+{
+  "$comment": "Example Open Tray rules. Copy to <your repo>/.claude/tray.json, or to ~/.claude/open-tray/rules/<repo folder name>.json to keep them out of the repo. Paths are from the repo root. {1} is the area's number padded by 'pad'; {1n} is the plain number; {each} is a folder matched by an action's 'each'.",
+  "areas": [
+    {
+      "key": "ch{1}",
+      "label": "Chapter {1n}",
+      "patterns": ["\\bch(?:apter)?[-_ ]?(\\d{1,2})\\b"],
+      "pad": 2
+    }
+  ],
+  "tag": "\\bch\\d\\d\\b",
+  "skip": ["/old/", "/drafts/"],
+  "related": [
+    { "label": "Renders", "paths": ["renders/ch{1}*"], "names": ["*.mp4", "*.mov"], "max": 4 },
+    { "label": "Audio", "paths": ["audio/ch{1}*"], "names": ["*.wav", "*.mp3"], "as": "folder", "max": 4 },
+    { "label": "Pages", "paths": ["docs"], "names": ["*.html", "*.pdf"], "pathMatch": "ch0?{1n}", "onePerFolder": true, "max": 3 }
+  ],
+  "actions": [
+    { "label": "Preview {each}", "each": "chapters/ch{1}*", "prompt": "Start a preview server for {each} and put its URL in the Open Tray." }
+  ],
+  "servers": { "spot": "npm run preview" }
+}

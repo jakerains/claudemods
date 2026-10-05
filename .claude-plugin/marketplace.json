@@ -1,0 +1,25 @@
+{
+  "name": "claudemods",
+  "description": "Small Claude Code mods: context and plan-usage gauges, a prompt-cache meter, and a pane of things to look at.",
+  "owner": {
+    "name": "Jake Rains",
+    "url": "https://github.com/jakerains"
+  },
+  "plugins": [
+    {
+      "name": "context-gauge",
+      "source": "./context-gauge",
+      "description": "Context left, plus 5-hour and weekly plan usage with a reset countdown, on one line under the prompt; /gauge for a colour-coded context breakdown."
+    },
+    {
+      "name": "open-tray",
+      "source": "./open-tray",
+      "description": "Things to look at or listen to: made this session, plus related to what you are working on."
+    },
+    {
+      "name": "prompt-cache-control",
+      "source": "./prompt-cache-control",
+      "description": "Prompt-cache meter above the prompt: hit rate, a countdown to expiry and what to do about it; /cache for a per-turn table, /cache off|on to hide or show the bar."
+    }
+  ]
+}
