@@ -26,9 +26,12 @@ file paths, and where that area's good stuff lives. Put them in either:
 
 Start from `examples/tray.json`; its `$comment` explains every field.
 
-Actions (buttons that send Claude a prompt) are read only from your own
-`~/.claude/open-tray/rules/` file, never from a repo's `.claude/tray.json`: a
-button's label need not show the prompt it sends, so a repo you cloned could
-otherwise hide one. Patterns that are invalid, very long or prone to
-catastrophic backtracking are ignored, and the tray shows runnable files
-(apps, scripts, executables) in Finder instead of launching them.
+Rules decide which searches run and which patterns run on your prompts, so a
+repo's `.claude/tray.json` is not used until you trust it: the tray tells you
+it's there, you read it, then `/tray trust` (`/tray untrust` to stop). Trust is
+for that exact content; if the file changes, the tray asks again. Your own
+`~/.claude/open-tray/rules/` file is always used, and wins over the repo's.
+
+`open` resolves links first and opens only films, audio, images, pages,
+documents and folders; anything else (apps, scripts, bundles, profiles) is
+shown in Finder instead of launched.

@@ -61,10 +61,10 @@ export function startsServer(command: string, rules: Rules | null): boolean {
   return Boolean(regexOf(rules?.servers?.spot)?.test(text))
 }
 
-// Rules may come from a repo someone else wrote (`.claude/tray.json`), so their
-// patterns are untrusted: text they run on is cut short, and a pattern that is
-// too long, invalid, or nests quantifiers (`(a+)+`, the shape of catastrophic
-// backtracking) is ignored rather than run.
+// Best effort only: no check can tell every slow pattern from a fast one, so
+// the boundary is that rules run only once chosen (your own file, or a repo's
+// you trusted with /tray trust). Within that, text is cut short, and a pattern
+// that is too long, invalid, or nests quantifiers (`(a+)+`) is ignored.
 const MAX_TEXT = 2000
 const MAX_PATTERN = 300
 const NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*}](?:[^()\\]|\\.)*\)\s*[+*{]/

@@ -1,6 +1,6 @@
 {
   "name": "open-tray",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "A pane of things to look at or listen to: what Claude made this session, things related to what you are working on, and local servers. Project rules in .claude/tray.json or ~/.claude/open-tray/rules/.",
   "author": {
     "name": "Jake Rains"

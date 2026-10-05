@@ -82,6 +82,8 @@ const OUTPUT_FILE = /\/[^\s'"`]+\/tasks\/[\w-]+\.output\b/
 // This load's view of the project: its root and rules, read at session start.
 let root = ''
 let rules: Rules | null = null
+// A repo's own rules file waiting for /tray trust: its hash and where it is.
+let untrusted: { path: string; hash: string } | null = null
 let lastRefreshAt = 0
 
 export const register: Register = on => {
@@ -91,7 +93,8 @@ export const register: Register = on => {
     rules = await loadRules($, root)
     await $.command.register({
       name: 'tray',
-      description: 'Show the Open Tray: things made for you this session, and things related to what we are working on',
+      description: "Show the Open Tray: things made for you this session, and things related to what we are working on (trust: use this repo's .claude/tray.json)",
+      argumentHint: '[trust|untrust]',
       immediate: true,
     })
     await $.tool.register({
@@ -215,14 +218,17 @@ export const register: Register = on => {
     return result
   })
 
-  on('command.run', { command: 'tray' }, async $ => {
+  on('command.run', { command: 'tray' }, async ($, e) => {
+    const word = e.args.trim().toLowerCase()
+    if (word === 'trust' || word === 'untrust') return { text: await trustRepo($, word === 'trust') }
     const opened = await $.ui.open({ id: PANE, title: 'Open Tray', focus: true })
     const count = (await read($, items)).length
     const r = await read($, related)
 
+    const note = untrusted ? ` This repo has rules (${untrusted.path}); review them, then /tray trust to use them.` : ''
     return {
       text: opened.isPlaced
-        ? `Open Tray: ${count} made this session${r.area ? `, ${r.label} related` : ''}.`
+        ? `Open Tray: ${count} made this session${r.area ? `, ${r.label} related` : ''}.${note}`
         : 'Open Tray could not be placed; widen the terminal.',
     }
   })
@@ -393,28 +399,29 @@ async function runRow($: EngineInterface, index: number) {
   await openSafely($, row.item.target, row.item.kind)
 }
 
-// Apps, scripts and other runnable files, which `open` would launch rather than show.
-const RUNNABLE = new Set([
-  'app', 'command', 'sh', 'bash', 'zsh', 'fish', 'csh', 'tcsh', 'ksh', 'tool', 'terminal', 'workflow', 'action',
-  'pkg', 'mpkg', 'scpt', 'scptd', 'applescript', 'jar', 'py', 'rb', 'pl', 'php', 'js', 'mjs', 'cjs', 'exe', 'bat',
-  'webloc', 'inetloc', 'fileloc', 'url', 'desktop', 'prefpane', 'saver', 'shortcut',
-])
-
-// Opens a file or URL to look at it; a runnable one (by its suffix, or an
-// executable file of any name) is revealed in Finder instead of launched.
+// Opens a file or folder to look at it. The link is resolved first, and only
+// what is plainly for viewing opens (films, audio, images, pages, documents, a
+// folder); anything else (an app, a script, a bundle, a profile) is shown in
+// Finder, since `open` would launch it.
 async function openSafely($: EngineInterface, target: string, kind: string) {
-  if (kind !== 'url') {
-    const suffix = target.replace(/\/+$/, '').split('.').pop()?.toLowerCase() ?? ''
-    const runnable =
-      RUNNABLE.has(suffix) ||
-      ((await $.fs.stat(target).catch(() => null))?.kind === 'file' && (await $.process.run(['test', '-x', target])).exitCode === 0)
-    if (runnable) {
-      $.ui.toast('Shown in Finder: Open Tray does not launch apps or scripts')
-      await $.process.run(['open', '-R', target])
-      return
-    }
+  if (kind === 'url') {
+    if (/^https?:\/\//i.test(target)) await $.process.run(['open', target])
+    return
   }
-  await $.process.run(['open', target])
+  const linked = await $.fs.stat(target, { resolve: true }).catch(() => null)
+  const real = linked?.realPath ?? target
+  const stat = await $.fs.stat(real).catch(() => null)
+  if (!stat) {
+    $.ui.toast(`Not found: ${baseName(target)}`)
+    return
+  }
+  const isViewable = stat.kind === 'file' ? kindOf(real) !== 'other' : stat.kind === 'dir' && !baseName(real).includes('.')
+  if (!isViewable) {
+    $.ui.toast('Shown in Finder: Open Tray opens only films, audio, images, pages and documents')
+    await $.process.run(['open', '-R', real])
+    return
+  }
+  await $.process.run(['open', real])
 }
 
 async function act($: EngineInterface, index: number, action: 'finder' | 'audio') {
@@ -557,25 +564,56 @@ async function refresh($: EngineInterface, area: Area) {
   await update($, related, r => (r.area === area.key ? { ...r, groups, actions } : r))
 }
 
+// Rules decide which shell searches run and which patterns run on your prompts,
+// so only rules you chose are used: your own (~/.claude/open-tray/rules/), or a
+// repo's .claude/tray.json once you have trusted that exact content with
+// `/tray trust` (a changed file asks again).
 async function loadRules($: EngineInterface, projectRoot: string): Promise<Rules | null> {
   const home = (await $.env.get('HOME')) ?? ''
-  for (const path of rulesPaths(projectRoot, home)) {
-    try {
-      const found = JSON.parse(await $.fs.read(path)) as Rules
-      // A repo's own rules may name areas and related files, but not actions:
-      // an action sends Claude a prompt the button's label need not show, so
-      // only the person's own rules (~/.claude/open-tray/rules/) may have them.
-      if (path.startsWith(`${projectRoot}/`) && found.actions?.length) {
-        $.ui.log(`open-tray: ignoring ${found.actions.length} action(s) in ${path}; put actions in ~/.claude/open-tray/rules/ instead`, { to: 'debug' })
-        return { ...found, actions: [] }
-      }
-      return found
-    } catch {
-      // Not there, or not valid JSON: try the next one.
-    }
-  }
+  const [repoPath, ownPath] = rulesPaths(projectRoot, home)
+  untrusted = null
+  const own = await readRules($, ownPath!)
+  if (own) return own.rules
+  const repo = await readRules($, repoPath!)
+  if (!repo) return null
+  const trusted = ((await $.store.get('trusted').catch(() => undefined)) ?? {}) as Record<string, string>
+  if (trusted[projectRoot] === repo.hash) return repo.rules
+  untrusted = { path: '.claude/tray.json', hash: repo.hash }
+  $.ui.toast('This repo has Open Tray rules (.claude/tray.json). Review them, then /tray trust to use them.')
 
   return null
+}
+
+async function readRules($: EngineInterface, path: string): Promise<{ rules: Rules; hash: string } | null> {
+  try {
+    const text = await $.fs.read(path)
+    return { rules: JSON.parse(text) as Rules, hash: await sha256(text) }
+  } catch {
+    return null // Not there, or not valid JSON.
+  }
+}
+
+async function sha256(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+async function trustRepo($: EngineInterface, isTrusting: boolean): Promise<string> {
+  const trusted = ((await $.store.get('trusted').catch(() => undefined)) ?? {}) as Record<string, string>
+  if (!isTrusting) {
+    delete trusted[root]
+    await $.store.set('trusted', trusted)
+    rules = await loadRules($, root)
+    return "Open Tray: this repo's rules are no longer used."
+  }
+  if (!untrusted) return rules ? 'Open Tray: rules already in use.' : 'Open Tray: this repo has no .claude/tray.json.'
+  trusted[root] = untrusted.hash
+  await $.store.set('trusted', trusted)
+  rules = await loadRules($, root)
+  const r = await read($, related)
+  const area = r.area ? areaFromKey(r.area, []) : null
+  if (area) await refresh($, area)
+  return "Open Tray: using this repo's rules. If .claude/tray.json changes, /tray trust again."
 }
 
 // ── Review players ───────────────────────────────────────────────────────────

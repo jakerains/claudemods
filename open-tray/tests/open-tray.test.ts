@@ -20,7 +20,13 @@ const RULES = JSON.stringify({
 
 const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 
-function engine(on: any, opts: { rules: string | null; rulesAt?: string; ran?: string[][]; prompts?: string[]; bashText?: string; executable?: string[] }) {
+const OWN_RULES = '/Users/x/.claude/open-tray/rules/w.json'
+const REPO_RULES = '/w/.claude/tray.json'
+
+function engine(
+  on: any,
+  opts: { rules: string | null; rulesAt?: string; ran?: string[][]; prompts?: string[]; bashText?: string; links?: Record<string, string>; toasts?: string[] },
+) {
   mock.clock(on, { now: 10_000_000 })
   mock.env(on, { HOME: '/Users/x', TMPDIR: '/tmp/' })
   on('command.register', () => ({ value: { command: 'tray' } }))
@@ -32,22 +38,30 @@ function engine(on: any, opts: { rules: string | null; rulesAt?: string; ran?: s
   on('ui.panes', () => ({ value: [] }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.log', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', ($: any, e: any) => {
+    opts.toasts?.push(String(e.text))
+    return { value: undefined }
+  })
+  const kept: Record<string, unknown> = {}
+  on('store.get', ($: any, e: any) => ({ value: kept[e.key] }))
+  on('store.set', ($: any, e: any) => {
+    kept[e.key] = e.value
+    return { value: undefined }
+  })
   on('prompt.submit', ($: any, e: any) => {
     opts.prompts?.push(e.text)
     return { text: e.text }
   })
   on('fs.read', ($: any, e: any) => {
-    if (opts.rules && e.path === (opts.rulesAt ?? '/w/.claude/tray.json')) return { value: opts.rules }
+    if (opts.rules && e.path === (opts.rulesAt ?? OWN_RULES)) return { value: opts.rules }
     throw new Error('ENOENT')
   })
-  on('fs.stat', () => ({ value: { kind: 'file', size: 10, mtimeMs: 9_000_000, isLink: false } }))
+  on('fs.stat', ($: any, e: any) => {
+    const to = opts.links?.[e.path]
+    return { value: { kind: 'file', size: 10, mtimeMs: 9_000_000, isLink: Boolean(to), ...(e.resolve ? { realPath: to ?? e.path } : {}) } }
+  })
   on('process.run', ($: any, e: any) => {
     opts.ran?.push([...e.argv])
-    if (e.argv[0] === 'test') {
-      const isX = opts.executable?.includes(e.argv[2])
-      return { value: { exitCode: isX ? 0 : 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    }
     const script = String(e.argv[2] ?? '')
     if (e.argv[0] === '/bin/sh' && script.includes(' find ')) {
       if (script.includes("'lessons/m02-'")) return out('lessons/m02-l01/opening.mp4\n')
@@ -111,8 +125,7 @@ describe('open-tray', () => {
     expect(await ui.find({ type: 'Text', text: /^MODULE 2$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /Lesson films/ })).toBeDefined()
     expect(await ui.find({ type: 'Button', text: /opening\.mp4/ })).toBeDefined()
-    // Actions come only from the person's own rules, never a repo's (see below).
-    expect(await ui.find({ type: 'Button', text: /Start m02-l02/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Button', text: /Start m02-l02/ })).toBeDefined()
 
     await say($, 'now module 3')
     expect(await ui.find({ type: 'Button', text: /knowledge\.mp4/ })).toBeDefined()
@@ -183,37 +196,55 @@ describe('open-tray', () => {
     await ui.unmount()
   })
 
-  test("rules can live in the person's own folder instead of the repo, and only there may they have actions", async ($, on) => {
-    const prompts: string[] = []
-    engine(on, { rules: RULES, rulesAt: '/Users/x/.claude/open-tray/rules/w.json', prompts })
+  test("a repo's own rules wait for /tray trust, and a changed file asks again", async ($, on) => {
+    const toasts: string[] = []
+    const opts = { rules: RULES, rulesAt: REPO_RULES, toasts }
+    engine(on, opts)
     await start($)
+    expect(toasts.some(t => /tray trust/.test(t))).toBe(true)
     const ui = await $.ui.mount(PANE)
     await say($, 'module 2')
+    expect(await ui.find({ type: 'Text', text: /^MODULE 2$/ })).toBeUndefined()
 
+    const trusted = await $.command.run({ command: 'tray', args: 'trust' } as any)
+    expect((trusted as any).text).toMatch(/using this repo's rules/)
+    await say($, 'module 2')
     expect(await ui.find({ type: 'Text', text: /^MODULE 2$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Button', text: /opening\.mp4/ })).toBeDefined()
     expect(await ui.find({ type: 'Button', text: /Start m02-l02/ })).toBeDefined()
     await ui.unmount()
+
+    // a reload with the same file: still trusted; an edited file: not
+    await start($)
+    expect(toasts.filter(t => /tray trust/.test(t)).length).toBe(1)
+    opts.rules = RULES.replace('Lesson films', 'Films')
+    await start($)
+    expect(toasts.filter(t => /tray trust/.test(t)).length).toBe(2)
   })
 
-  test('a runnable file (by suffix, or executable) is shown in Finder, never launched', async ($, on) => {
+  test('only films, audio, images, pages and documents open; anything else, or a link to it, is shown in Finder', async ($, on) => {
     const ran: string[][] = []
-    engine(on, { rules: null, ran, executable: ['/w/tools/run'] })
+    engine(on, { rules: null, ran, links: { '/w/films/film.mp4': '/w/evil.command' } })
     await start($)
-    await $.tool.call({ tool: 'mcp__open-tray__offer', target: '/w/tools/setup.command' } as any)
-    const ui = await $.ui.mount(PANE)
-    ran.length = 0
-    await ui.press({ key: 'open' })
-    expect(ran).toContainEqual(['open', '-R', '/w/tools/setup.command'])
-    expect(ran).not.toContainEqual(['open', '/w/tools/setup.command'])
-    await ui.unmount()
+    const openNewest = async (target: string) => {
+      await $.tool.call({ tool: 'mcp__open-tray__offer', target } as any)
+      const ui = await $.ui.mount(PANE)
+      ran.length = 0
+      await ui.press({ key: 'open' })
+      await ui.unmount()
+    }
 
-    await $.tool.call({ tool: 'mcp__open-tray__offer', target: '/w/tools/run' } as any)
-    const ui2 = await $.ui.mount(PANE)
-    ran.length = 0
-    await ui2.press({ key: 'open' })
-    expect(ran).toContainEqual(['open', '-R', '/w/tools/run'])
-    await ui2.unmount()
+    await openNewest('/w/films/cut.mp4')
+    expect(ran).toContainEqual(['open', '/w/films/cut.mp4'])
+
+    for (const target of ['/w/tools/setup.command', '/w/tools/run', '/w/x.mobileconfig']) {
+      await openNewest(target)
+      expect(ran).toContainEqual(['open', '-R', target])
+      expect(ran).not.toContainEqual(['open', target])
+    }
+
+    await openNewest('/w/films/film.mp4')
+    expect(ran).toContainEqual(['open', '-R', '/w/evil.command'])
+    expect(ran.some(argv => argv.length === 2 && argv[0] === 'open')).toBe(false)
   })
 })
 
