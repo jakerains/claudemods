@@ -390,7 +390,31 @@ async function runRow($: EngineInterface, index: number) {
     await $.prompt.submit({ text: row.action.prompt })
     return
   }
-  await $.process.run(['open', row.item.target])
+  await openSafely($, row.item.target, row.item.kind)
+}
+
+// Apps, scripts and other runnable files, which `open` would launch rather than show.
+const RUNNABLE = new Set([
+  'app', 'command', 'sh', 'bash', 'zsh', 'fish', 'csh', 'tcsh', 'ksh', 'tool', 'terminal', 'workflow', 'action',
+  'pkg', 'mpkg', 'scpt', 'scptd', 'applescript', 'jar', 'py', 'rb', 'pl', 'php', 'js', 'mjs', 'cjs', 'exe', 'bat',
+  'webloc', 'inetloc', 'fileloc', 'url', 'desktop', 'prefpane', 'saver', 'shortcut',
+])
+
+// Opens a file or URL to look at it; a runnable one (by its suffix, or an
+// executable file of any name) is revealed in Finder instead of launched.
+async function openSafely($: EngineInterface, target: string, kind: string) {
+  if (kind !== 'url') {
+    const suffix = target.replace(/\/+$/, '').split('.').pop()?.toLowerCase() ?? ''
+    const runnable =
+      RUNNABLE.has(suffix) ||
+      ((await $.fs.stat(target).catch(() => null))?.kind === 'file' && (await $.process.run(['test', '-x', target])).exitCode === 0)
+    if (runnable) {
+      $.ui.toast('Shown in Finder: Open Tray does not launch apps or scripts')
+      await $.process.run(['open', '-R', target])
+      return
+    }
+  }
+  await $.process.run(['open', target])
 }
 
 async function act($: EngineInterface, index: number, action: 'finder' | 'audio') {
@@ -407,7 +431,7 @@ async function act($: EngineInterface, index: number, action: 'finder' | 'audio'
     return
   }
   if (item.kind === 'audio') {
-    await $.process.run(['open', item.target])
+    await openSafely($, item.target, item.kind)
     return
   }
   if (item.kind !== 'video') {
@@ -508,7 +532,7 @@ async function refresh($: EngineInterface, area: Area) {
   const skip = skipList(rules)
   const groups: RelatedGroup[] = []
   for (const rule of relatedPlan(area, rules)) {
-    const run = await $.process.run(['/bin/sh', '-c', findScript(root, rule.paths, rule.names, rule.maxDepth ?? 6)], { timeoutMs: 15_000 })
+    const run = await $.process.run(['/bin/sh', '-c', findScript(root, rule.paths, rule.names, rule.maxDepth)], { timeoutMs: 15_000 })
     const found = run.stdout
       .split('\n')
       .map(line => line.replace(/^\.\//, ''))
@@ -537,7 +561,15 @@ async function loadRules($: EngineInterface, projectRoot: string): Promise<Rules
   const home = (await $.env.get('HOME')) ?? ''
   for (const path of rulesPaths(projectRoot, home)) {
     try {
-      return JSON.parse(await $.fs.read(path)) as Rules
+      const found = JSON.parse(await $.fs.read(path)) as Rules
+      // A repo's own rules may name areas and related files, but not actions:
+      // an action sends Claude a prompt the button's label need not show, so
+      // only the person's own rules (~/.claude/open-tray/rules/) may have them.
+      if (path.startsWith(`${projectRoot}/`) && found.actions?.length) {
+        $.ui.log(`open-tray: ignoring ${found.actions.length} action(s) in ${path}; put actions in ~/.claude/open-tray/rules/ instead`, { to: 'debug' })
+        return { ...found, actions: [] }
+      }
+      return found
     } catch {
       // Not there, or not valid JSON: try the next one.
     }

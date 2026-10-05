@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import { areaIn, findScript, regexOf, relatedPlan } from '../hooks/rules.ts'
 
 const PANE = {
   plugin: 'open-tray',
@@ -19,7 +20,7 @@ const RULES = JSON.stringify({
 
 const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 
-function engine(on: any, opts: { rules: string | null; rulesAt?: string; ran?: string[][]; prompts?: string[]; bashText?: string }) {
+function engine(on: any, opts: { rules: string | null; rulesAt?: string; ran?: string[][]; prompts?: string[]; bashText?: string; executable?: string[] }) {
   mock.clock(on, { now: 10_000_000 })
   mock.env(on, { HOME: '/Users/x', TMPDIR: '/tmp/' })
   on('command.register', () => ({ value: { command: 'tray' } }))
@@ -30,6 +31,8 @@ function engine(on: any, opts: { rules: string | null; rulesAt?: string; ran?: s
   on('session.cwd', () => ({ value: '/w' }))
   on('ui.panes', () => ({ value: [] }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.log', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
   on('prompt.submit', ($: any, e: any) => {
     opts.prompts?.push(e.text)
     return { text: e.text }
@@ -41,6 +44,10 @@ function engine(on: any, opts: { rules: string | null; rulesAt?: string; ran?: s
   on('fs.stat', () => ({ value: { kind: 'file', size: 10, mtimeMs: 9_000_000, isLink: false } }))
   on('process.run', ($: any, e: any) => {
     opts.ran?.push([...e.argv])
+    if (e.argv[0] === 'test') {
+      const isX = opts.executable?.includes(e.argv[2])
+      return { value: { exitCode: isX ? 0 : 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const script = String(e.argv[2] ?? '')
     if (e.argv[0] === '/bin/sh' && script.includes(' find ')) {
       if (script.includes("'lessons/m02-'")) return out('lessons/m02-l01/opening.mp4\n')
@@ -104,7 +111,8 @@ describe('open-tray', () => {
     expect(await ui.find({ type: 'Text', text: /^MODULE 2$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /Lesson films/ })).toBeDefined()
     expect(await ui.find({ type: 'Button', text: /opening\.mp4/ })).toBeDefined()
-    expect(await ui.find({ type: 'Button', text: /Start m02-l02/ })).toBeDefined()
+    // Actions come only from the person's own rules, never a repo's (see below).
+    expect(await ui.find({ type: 'Button', text: /Start m02-l02/ })).toBeUndefined()
 
     await say($, 'now module 3')
     expect(await ui.find({ type: 'Button', text: /knowledge\.mp4/ })).toBeDefined()
@@ -175,14 +183,66 @@ describe('open-tray', () => {
     await ui.unmount()
   })
 
-  test("rules can live in the person's own folder instead of the repo", async ($, on) => {
-    engine(on, { rules: RULES, rulesAt: '/Users/x/.claude/open-tray/rules/w.json' })
+  test("rules can live in the person's own folder instead of the repo, and only there may they have actions", async ($, on) => {
+    const prompts: string[] = []
+    engine(on, { rules: RULES, rulesAt: '/Users/x/.claude/open-tray/rules/w.json', prompts })
     await start($)
     const ui = await $.ui.mount(PANE)
     await say($, 'module 2')
 
     expect(await ui.find({ type: 'Text', text: /^MODULE 2$/ })).toBeDefined()
     expect(await ui.find({ type: 'Button', text: /opening\.mp4/ })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: /Start m02-l02/ })).toBeDefined()
     await ui.unmount()
+  })
+
+  test('a runnable file (by suffix, or executable) is shown in Finder, never launched', async ($, on) => {
+    const ran: string[][] = []
+    engine(on, { rules: null, ran, executable: ['/w/tools/run'] })
+    await start($)
+    await $.tool.call({ tool: 'mcp__open-tray__offer', target: '/w/tools/setup.command' } as any)
+    const ui = await $.ui.mount(PANE)
+    ran.length = 0
+    await ui.press({ key: 'open' })
+    expect(ran).toContainEqual(['open', '-R', '/w/tools/setup.command'])
+    expect(ran).not.toContainEqual(['open', '/w/tools/setup.command'])
+    await ui.unmount()
+
+    await $.tool.call({ tool: 'mcp__open-tray__offer', target: '/w/tools/run' } as any)
+    const ui2 = await $.ui.mount(PANE)
+    ran.length = 0
+    await ui2.press({ key: 'open' })
+    expect(ran).toContainEqual(['open', '-R', '/w/tools/run'])
+    await ui2.unmount()
+  })
+})
+
+describe('untrusted rules', () => {
+  test('a depth from the rules cannot add to the shell command', () => {
+    const script = findScript('/w', ['lessons/*'], ['*.mp4'], '6; touch /tmp/pwned' as unknown)
+    expect(script).toContain('-maxdepth 6 ')
+    expect(script).not.toContain('touch')
+    expect(findScript('/w', ['x'], ['*.mp4'], 99)).toContain('-maxdepth 12 ')
+    expect(findScript('/w', ['x'], ['*.mp4'], undefined)).toContain('-maxdepth 6 ')
+  })
+
+  test('a pattern that would backtrack forever, or is invalid, is ignored', () => {
+    expect(regexOf('(a+)+$')).toBeNull()
+    expect(regexOf('(\\w*)*x')).toBeNull()
+    expect(regexOf('([a-z]+){2,}b')).toBeNull()
+    expect(regexOf('(')).toBeNull()
+    expect(regexOf('x'.repeat(301))).toBeNull()
+    expect(regexOf('\\bm(\\d\\d)\\b', 'i')?.test('m02')).toBe(true)
+    const evil = { areas: [{ key: 'a{1}', label: 'A', patterns: ['(a+)+$'] }] } as any
+    const started = Date.now()
+    expect(areaIn('a'.repeat(5000) + '!', evil)).toBeNull()
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
+
+  test("an area's values match as text inside a rule's pathMatch", () => {
+    const area = { key: 'x', label: 'x', values: { '1': 'a.b(', '1n': 'a.b(' } }
+    const [plan] = relatedPlan(area, { related: [{ label: 'L', paths: ['p'], names: ['*'], pathMatch: 'dir/{1}' }] } as any)
+    expect(plan?.pattern?.test('dir/a.b(')).toBe(true)
+    expect(plan?.pattern?.test('dir/aXb(')).toBe(false)
   })
 })

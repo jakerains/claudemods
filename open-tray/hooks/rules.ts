@@ -56,9 +56,41 @@ export const DEFAULT_SERVER_SPOT =
 
 /** Does this command start a server worth watching? */
 export function startsServer(command: string, rules: Rules | null): boolean {
-  if (new RegExp(DEFAULT_SERVER_SPOT).test(command)) return true
-  const own = rules?.servers?.spot
-  return Boolean(own && new RegExp(own).test(command))
+  const text = command.slice(0, MAX_TEXT)
+  if (new RegExp(DEFAULT_SERVER_SPOT).test(text)) return true
+  return Boolean(regexOf(rules?.servers?.spot)?.test(text))
+}
+
+// Rules may come from a repo someone else wrote (`.claude/tray.json`), so their
+// patterns are untrusted: text they run on is cut short, and a pattern that is
+// too long, invalid, or nests quantifiers (`(a+)+`, the shape of catastrophic
+// backtracking) is ignored rather than run.
+const MAX_TEXT = 2000
+const MAX_PATTERN = 300
+const NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*}](?:[^()\\]|\\.)*\)\s*[+*{]/
+const compiled = new Map<string, RegExp | null>()
+
+export function regexOf(pattern: unknown, flags = ''): RegExp | null {
+  if (typeof pattern !== 'string' || !pattern || pattern.length > MAX_PATTERN) return null
+  const key = `${flags}/${pattern}`
+  if (!compiled.has(key)) {
+    let re: RegExp | null = null
+    if (!NESTED_QUANTIFIER.test(pattern)) {
+      try {
+        re = new RegExp(pattern, flags)
+      } catch {
+        re = null
+      }
+    }
+    compiled.set(key, re)
+  }
+  return compiled.get(key) ?? null
+}
+
+/** A search depth from the rules, whatever they hold: a whole number from 1 to 12. */
+export function depthOf(value: unknown, fallback = 6): number {
+  const n = Math.floor(Number(value))
+  return Number.isFinite(n) ? Math.min(12, Math.max(1, n)) : fallback
 }
 
 export type Area = { key: string; label: string; values: Record<string, string> }
@@ -67,7 +99,7 @@ export type Area = { key: string; label: string; values: Record<string, string> 
 export function areaIn(text: string, rules: Rules | null): Area | null {
   for (const rule of rules?.areas ?? []) {
     for (const pattern of rule.patterns) {
-      const match = new RegExp(pattern, 'i').exec(text)
+      const match = regexOf(pattern, 'i')?.exec(text.slice(0, MAX_TEXT))
       const raw = match?.slice(1).find(Boolean)
       if (!raw) continue
       const n = String(Number(raw))
@@ -92,7 +124,7 @@ export function folderArea(path: string, root: string): Area | null {
 
 export function tagOf(text: string, rules: Rules | null): string | null {
   if (!rules?.tag) return null
-  return new RegExp(rules.tag, 'i').exec(text)?.[0].toLowerCase() ?? null
+  return regexOf(rules.tag, 'i')?.exec(text.slice(0, MAX_TEXT))?.[0].toLowerCase() ?? null
 }
 
 export function kindOf(path: string): TrayKind {
@@ -113,7 +145,8 @@ export function relatedPlan(area: Area, rules: Rules | null): (RelatedRule & { p
     ...rule,
     paths: rule.paths.map(p => fill(p, area.values)),
     names: rule.names.map(n => fill(n, area.values)),
-    pattern: rule.pathMatch ? new RegExp(fill(rule.pathMatch, area.values), 'i') : null,
+    // The area's values come from prompts and paths: escaped, so they match as text.
+    pattern: rule.pathMatch ? regexOf(fill(rule.pathMatch, escapedValues(area.values)), 'i') : null,
   }))
 }
 
@@ -167,9 +200,10 @@ export function actionPattern(each: string, area: Area): string {
 }
 
 /** `find` over shell-expanded paths (the rules' own globs), names matched case-insensitively. */
-export function findScript(root: string, paths: string[], names: string[], depth: number): string {
+export function findScript(root: string, paths: string[], names: string[], depth: unknown): string {
+  // Everything from the rules is quoted; the depth goes in bare, so it is a number here.
   const nameTest = names.map(n => `-iname ${quote(n)}`).join(' -o ')
-  return `cd ${quote(root)} && for d in ${paths.map(globWord).join(' ')}; do [ -d "$d" ] && find "$d" -maxdepth ${depth} \\( -type f -o -type l \\) \\( ${nameTest} \\) -print; done 2>/dev/null | head -2000`
+  return `cd ${quote(root)} && for d in ${paths.map(globWord).join(' ')}; do [ -d "$d" ] && find "$d" -maxdepth ${depthOf(depth)} \\( -type f -o -type l \\) \\( ${nameTest} \\) -print; done 2>/dev/null | head -2000`
 }
 
 export function dirsScript(root: string, pattern: string): string {
@@ -178,6 +212,10 @@ export function dirsScript(root: string, pattern: string): string {
 
 function fill(template: string, values: Record<string, string>): string {
   return template.replace(/\{(\w+)\}/g, (whole, name: string) => values[name] ?? whole)
+}
+
+function escapedValues(values: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(values).map(([k, v]) => [k, v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')]))
 }
 
 function quote(text: string): string {
