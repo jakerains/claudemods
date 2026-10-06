@@ -168,6 +168,10 @@ describe('context-gauge', () => {
     expect(await wide.find({ type: 'Text', text: /^ · 2:1[34]:\d\d$/ }), 'countdown').toBeDefined()
     expect(await wide.find({ type: 'Text', text: /wk/ }), 'weekly label').toBeDefined()
     expect(await wide.find({ type: 'Text', text: /^60%$/ }), 'weekly left').toBeDefined()
+    // the context bar is the line's only bar: the 5-hour window is a number
+    expect(await wide.find({ type: 'Text', text: /^█+$/ }), 'context bar').toBeDefined()
+    expect(await wide.find({ type: 'Text', text: /^░{10}$|^░+$/ }), 'context bar track').toBeDefined()
+    expect((await wide.findAll({ type: 'Text', text: /^█+$/ })).length, 'one bar').toBe(1)
 
     used = 95
     await $.tool.call({ tool: 'Bash', command: 'true' } as any)
@@ -200,6 +204,59 @@ describe('context-gauge', () => {
     expect(await ui.find({ type: 'Text', text: /900K free/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /5h/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /wk/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('t/s: output tokens over the time from the first token, averaged over the last three responses', async ($, on) => {
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('session.model', () => ({ value: 'claude-opus-5-5' }))
+    on('settings.read', () => ({ value: {} }))
+    on('command.register', () => ({ value: { command: 'gauge' } }) as any)
+    on('store.get', () => ({ value: undefined }))
+    on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], context: { tokens: 100_000, window: 1_000_000, percent: 10 } } }) as any)
+    on('process.run', () => ok('/Users/x/claudemods\n'))
+    on('ui.render', { component: 'PromptHint' }, ($, e) => $.ui.resolve(e).Text({ children: '? for shortcuts' }))
+    // A response: a wait before the first token, then `seconds` of tokens.
+    // (Only the engine makes engine chunks, so the envelope is not modelled here.)
+    let out = 0
+    let seconds = 0
+    on('turn.step', async function* ($, e) {
+      await clock.advance(4000)
+      yield { kind: 'text', index: 0, text: 'hi' } as any
+      await clock.advance(seconds * 1000)
+      return { turnId: e.turnId, index: e.index, answer: 'hi', toolUses: [], stopReason: 'end_turn', usage: { model: 'claude-opus-5-5', input_tokens: 10, output_tokens: out } } as any
+    })
+    const step = async (tokens: number, secs: number, agentId?: string) => {
+      out = tokens
+      seconds = secs
+      const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 2, ...(agentId ? { agentId } : {}) } as any)
+      for (;;) if ((await stream.next()).done) return
+    }
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+    const ui = await $.ui.mount({
+      plugin: 'context-gauge',
+      surface: 'terminal',
+      component: 'PromptHint',
+      props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+      viewport: { columns: 140, rows: 40 },
+    } as any)
+    expect(await ui.find({ type: 'Text', text: /t\/s/ }), 'nothing before a response').toBeUndefined()
+
+    // 300 tokens in 5 s: 60, the 4 s wait before the first token left out
+    await step(300, 5)
+    expect(await ui.find({ type: 'Text', text: /^  ·  60 t\/s$/ })).toBeDefined()
+    // a short response and a subagent's leave it alone
+    await step(20, 1)
+    await step(900, 3, 'agent-1')
+    expect(await ui.find({ type: 'Text', text: /60 t\/s/ })).toBeDefined()
+    // 90 and 120 join it: (60 + 90 + 120) / 3; then 30 pushes 60 out: (90 + 120 + 30) / 3
+    await step(450, 5)
+    await step(600, 5)
+    expect(await ui.find({ type: 'Text', text: /90 t\/s/ })).toBeDefined()
+    await step(150, 5)
+    expect(await ui.find({ type: 'Text', text: /80 t\/s/ })).toBeDefined()
     await ui.unmount()
   })
 })

@@ -1,11 +1,12 @@
 // Context Gauge: one line under the prompt with repo/branch, model, effort and
 // how much context is left. Replaces the old status line script.
 //
-//   my-project/main · Opus 5.5 1M · high  ████████████░░░░░░░░ 62% · 620K free  ·  5h ███████░░░ 72% · 2:14:05  ·  wk 60%
+//   my-project/main · Opus 5.5 1M · high  ████████████░░░░░░░░ 62% · 620K free  ·  5h 72% · 2:14:05  ·  wk 60%  ·  68 t/s
 //
-// The second bar is the plan's 5-hour usage window: what is left, draining
-// from 100% to 0, and a countdown to its reset; `wk` is what is left of the
-// weekly window. Only on a subscription.
+// `5h` is the plan's 5-hour usage window: what is left, draining from 100% to
+// 0, and a countdown to its reset; `wk` is what is left of the weekly window.
+// Both only on a subscription. `t/s` is how fast Claude writes: output tokens
+// per second of the last few main-loop responses, timed from the first token.
 //
 // `/gauge` swaps that line for a detailed band above the prompt: one bar split
 // by what fills the window (/context's categories and colours), and a key.
@@ -24,12 +25,18 @@ const detail = atom({ plugin: 'context-gauge', key: 'detail' } as const, false)
 const breakdown = atom({ plugin: 'context-gauge', key: 'breakdown' } as const, null as GaugeBreakdown | null)
 const limits = atom({ plugin: 'context-gauge', key: 'limits' } as const, [] as GaugeLimit[])
 const clock = atom({ plugin: 'context-gauge', key: 'now' } as const, 0)
+const speed = atom({ plugin: 'context-gauge', key: 'speed' } as const, [] as number[])
 
 // The countdown's ticker; a reload drops it and session.start starts another.
 let lastTick = ''
 
 // A breakdown is a local estimate, but a long turn calls tools often.
 const BREAKDOWN_EVERY_MS = 3000
+
+// A response shorter than this says little about speed (a lone tool call).
+const SPEED_MIN_TOKENS = 50
+// Responses averaged into the t/s figure.
+const SPEED_SAMPLES = 3
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -80,14 +87,31 @@ export const register: Register = on => {
     }
   })
 
-  // The model and effort each main-loop request actually goes out with.
+  // The model and effort each main-loop request actually goes out with, and
+  // how fast its response streams: output tokens over the time from the first
+  // token (text, thinking or a tool call) to the end, so the wait before
+  // Claude starts answering does not count against its speed.
   on('turn.step', async function* ($, e, next) {
-    if (!e.agentId) {
-      const effort = e.effort === undefined ? null : String(e.effort)
-      await update($, reading, r => ({ ...r, model: e.model, effort }))
-    }
+    if (e.agentId) return yield* next(e)
+    const effort = e.effort === undefined ? null : String(e.effort)
+    await update($, reading, r => ({ ...r, model: e.model, effort }))
 
-    return yield* next(e)
+    const stream = next(e)
+    let firstAt: number | undefined
+    for (;;) {
+      const n = await stream.next()
+      if (n.done) {
+        const out = n.value.usage?.output_tokens ?? 0
+        if (firstAt !== undefined && out >= SPEED_MIN_TOKENS) {
+          const seconds = ((await $.clock.now()) - firstAt) / 1000
+          if (seconds > 0) await update($, speed, s => [...s, out / seconds].slice(-SPEED_SAMPLES))
+        }
+        return n.value
+      }
+      // the engine's own chunks (the envelope) come before any token
+      if (firstAt === undefined && n.value.kind !== 'engine' && n.value.kind !== 'stop') firstAt = await $.clock.now()
+      yield n.value
+    }
   })
 
   // Pushed after every main-thread turn.
@@ -145,6 +169,7 @@ export const register: Register = on => {
     const five = windows.find(l => l.kind === 'five_hour')
     const week = windows.find(l => l.kind === 'seven_day')
     const now = await read($, clock)
+    const tps = average(await read($, speed))
 
     return (
       <Box flexDirection="column">
@@ -152,6 +177,7 @@ export const register: Register = on => {
           {gauge(Text, r, columns)}
           {five ? usage(Text, five, now, columns) : null}
           {week ? weekly(Text, week, now) : null}
+          {tps !== null ? <Text dimColor>{`  ·  ${Math.round(tps)} t/s`}</Text> : null}
         </Box>
         {engine}
       </Box>
@@ -225,20 +251,16 @@ function leftColor(left: number): string {
   return left > 20 ? 'green' : left >= 10 ? 'yellow' : 'red'
 }
 
+function average(values: readonly number[]): number | null {
+  return values.length ? values.reduce((sum, v) => sum + v, 0) / values.length : null
+}
+
 // What is left of the 5-hour window, draining from 100% to 0, and the time to
 // its reset. Past the reset it reads full until the next response says more.
 function usage(Text: any, five: GaugeLimit, now: number, columns: number) {
   const left = leftOf(five, now)
-  const color = leftColor(left)
   const parts = [<Text dimColor>{'  ·  5h '}</Text>]
-  if (columns >= 100) {
-    const width = 10
-    const filled = Math.min(width, Math.round((left * width) / 100))
-    parts.push(<Text color={color}>{'█'.repeat(filled)}</Text>)
-    parts.push(<Text dimColor>{'░'.repeat(width - filled)}</Text>)
-    parts.push(<Text>{' '}</Text>)
-  }
-  parts.push(<Text color={color}>{`${left}%`}</Text>)
+  parts.push(<Text color={leftColor(left)}>{`${left}%`}</Text>)
   const label = countdown([five], now)
   if (label) parts.push(<Text dimColor>{` · ${columns >= 100 ? label : label.replace(/^(\d+:\d\d):\d\d$/, '$1')}`}</Text>)
 

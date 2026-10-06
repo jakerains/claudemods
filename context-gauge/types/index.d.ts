@@ -43,6 +43,8 @@ declare module 'claude-code' {
       limits: GaugeLimit[]
       // The clock the usage countdown reads, moved once a second while it shows.
       now: number
+      // Output tokens per second of the last few main-loop responses, newest last.
+      speed: number[]
     }
   }
 }

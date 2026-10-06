@@ -1,6 +1,6 @@
 {
   "name": "context-gauge",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "One line under the prompt: model, effort, repo/branch, context left, and on a Claude subscription the 5-hour and weekly usage left with a countdown to reset. /gauge swaps it for a colour-coded context breakdown above the prompt.",
   "author": {
     "name": "Jake Rains"

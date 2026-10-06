@@ -3,7 +3,7 @@
 One line under the Claude Code prompt:
 
 ```
-my-project/main · Opus 5.5 1M · high  ██████████░░ 52% · 520K free  ·  5h ███████░░░ 72% · 2:14:05  ·  wk 60%
+my-project/main · Opus 5.5 1M · high  ██████████░░ 52% · 520K free  ·  5h 72% · 2:14:05  ·  wk 60%  ·  68 t/s
 ```
 
 | Piece | What it is |
@@ -11,12 +11,14 @@ my-project/main · Opus 5.5 1M · high  ██████████░░ 52%
 | `my-project/main` | Repo and branch (shown from 100 columns) |
 | `Opus 5.5 1M · high` | The model each request goes out with, its window, and effort |
 | bar `52% · 520K free` | Room left in the context window |
-| `5h` bar `72% · 2:14:05` | What's left of the plan's 5-hour usage window, and the time to its reset |
+| `5h 72% · 2:14:05` | What's left of the plan's 5-hour usage window, and the time to its reset |
 | `wk 60%` | What's left of the weekly window |
+| `68 t/s` | How fast Claude writes: output tokens per second, averaged over the last three main-loop responses of 50 tokens or more, timed from the first token so the wait before Claude starts answering doesn't count |
 
 Colours: green, yellow under 20% left, red under 10%. The usage parts show only
 on a Claude subscription (an API key or cloud provider reports no plan windows).
-Under 100 columns the usage bar drops and `5h 72% · 2:14` stays.
+Under 100 columns the countdown drops its seconds: `5h 72% · 2:14`. Speed shows on
+any account once a response has streamed; thinking tokens count as output.
 
 ## /gauge
 
