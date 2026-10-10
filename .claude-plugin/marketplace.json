@@ -14,7 +14,7 @@
     {
       "name": "open-tray",
       "source": "./open-tray",
-      "description": "Things to look at or listen to: made this session, plus related to what you are working on."
+      "description": "POWERTRAY: things to look at or listen to (made this session, related to what you are on), an in-tray player, and a recap of big moves."
     },
     {
       "name": "prompt-cache-control",

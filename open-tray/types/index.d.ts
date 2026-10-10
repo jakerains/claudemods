@@ -31,6 +31,47 @@ export type ReviewPlayer = {
   isAlive: boolean
 }
 
+/** The sound playing in the tray: a film's audio or an audio file. */
+export type NowPlaying = {
+  target: string
+  label: string
+  /** Seconds into the file where the current stretch started (or where it is paused). */
+  offset: number
+  /** When the current stretch started playing; null while paused. */
+  startedAt: number | null
+  /** The file's length in seconds, when ffprobe could tell. */
+  duration: number | null
+}
+
+/** One plain-words recap of a stretch of work. */
+export type Recap = {
+  at: number
+  did: string[]
+  /** What the person has to do before the work can go on. */
+  waiting: string[]
+  next: string
+  /** Asked for with "recap now", rather than written after a big move. */
+  isAsked: boolean
+}
+
+export type Recaps = {
+  /** Newest first. */
+  list: Recap[]
+  /** Which recap the tab shows: an index into list. */
+  view: number
+  isWriting: boolean
+  /** A recap the person has not looked at yet. */
+  isNew: boolean
+  /** Ticked to-dos, as "<recap at>:<index>". */
+  ticked: string[]
+}
+
+/** The work since the last recap: what makes a stretch a big move. */
+export type Work = {
+  agents: number
+  files: string[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'open-tray': {
@@ -41,6 +82,12 @@ declare module 'claude-code' {
       /** Recent area votes, newest last: from prompts and the files Claude touches. */
       signals: string[]
       hidden: string[]
+      tab: 'tray' | 'recap'
+      playing: NowPlaying | null
+      /** Ticks once a second while something plays, so the pane redraws its clock. */
+      tick: number
+      recaps: Recaps
+      work: Work
     }
   }
 }

@@ -60,11 +60,13 @@ Adapted from [claude-code-templates](https://github.com/davila7/claude-code-temp
 (MIT, Daniel Ávila): history survives reloads, and the bar shares the space above
 the prompt with other mods. [More →](prompt-cache-control/README.md)
 
-### open-tray
+### open-tray (POWERTRAY)
 
 A pane (`/tray`) of things to look at or listen to while you work: what Claude
 made or opened this session, things related to the area you're in, and local dev
-servers with a live dot. macOS. [More →](open-tray/README.md)
+servers you can stop or restart. `a` plays a film's sound right in the tray. A
+Recap tab says, after a big move, what was done, what waits on you and what
+comes next. macOS. [More →](open-tray/README.md)
 
 ## Develop
 

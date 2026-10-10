@@ -25,9 +25,22 @@ const REPO_RULES = '/w/.claude/tray.json'
 
 function engine(
   on: any,
-  opts: { rules: string | null; rulesAt?: string; ran?: string[][]; prompts?: string[]; bashText?: string; links?: Record<string, string>; toasts?: string[] },
+  opts: {
+    rules: string | null
+    rulesAt?: string
+    ran?: string[][]
+    prompts?: string[]
+    bashText?: string
+    links?: Record<string, string>
+    toasts?: string[]
+    mtime?: number
+    folders?: string
+    spawned?: string[][]
+    forks?: string[]
+    agents?: { status: string }[]
+  },
 ) {
-  mock.clock(on, { now: 10_000_000 })
+  const clock = mock.clock(on, { now: 10_000_000 })
   mock.env(on, { HOME: '/Users/x', TMPDIR: '/tmp/' })
   on('command.register', () => ({ value: { command: 'tray' } }))
   on('tool.register', () => ({ value: { tool: 'mcp__open-tray__offer' } }))
@@ -58,11 +71,16 @@ function engine(
   })
   on('fs.stat', ($: any, e: any) => {
     const to = opts.links?.[e.path]
-    return { value: { kind: 'file', size: 10, mtimeMs: 9_000_000, isLink: Boolean(to), ...(e.resolve ? { realPath: to ?? e.path } : {}) } }
+    return { value: { kind: 'file', size: 10, mtimeMs: opts.mtime ?? 9_000_000, isLink: Boolean(to), ...(e.resolve ? { realPath: to ?? e.path } : {}) } }
   })
   on('process.run', ($: any, e: any) => {
     opts.ran?.push([...e.argv])
     const script = String(e.argv[2] ?? '')
+    if (e.argv[0] === 'ffplay') return out('ffplay version 9\n')
+    if (e.argv[0] === 'ffprobe') return out('600.000000\n')
+    if (e.argv[0] === 'lsof') return out('4242\n')
+    if (e.argv[0] === 'ps') return out('/usr/local/bin/node\n')
+    if (e.argv[0] === '/bin/sh' && script.includes('-mindepth 1 -maxdepth 2')) return out(opts.folders ?? '')
     if (e.argv[0] === '/bin/sh' && script.includes(' find ')) {
       if (script.includes("'lessons/m02-'")) return out('lessons/m02-l01/opening.mp4\n')
       if (script.includes("'lessons/m03-'")) return out('lessons/m03-l01/knowledge.mp4\n')
@@ -76,13 +94,35 @@ function engine(
     return out('')
   })
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: opts.bashText ?? '' }) as any)
-  for (const tool of ['Read', 'Edit']) {
+  for (const tool of ['Read', 'Edit', 'Write']) {
     on('tool.call', { tool }, () => ({ result: { stdout: '', stderr: '', interrupted: false }, text: '' }) as any)
   }
+  // ffplay plays until the clock passes the hour, or the stream is closed.
+  on('process.spawn', async function* (_$: any, e: any) {
+    opts.spawned?.push([...e.argv])
+    await clock.sleep(3_600_000)
+    return { code: 0, signal: null }
+  } as any)
+  on('model.fork', ($: any, e: any) => {
+    opts.forks?.push(e.prompt)
+    return {
+      value: {
+        isAnswered: true,
+        text: '{"did": ["Built the player"], "waiting": ["Try it on a real film"], "next": "Phase 2: the recap"}',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    }
+  })
+  on('agent.list', () => ({ value: opts.agents ?? [] }))
+  on('turn.complete', () => ({ text: '' }))
+  on('ui.close', () => ({ value: undefined }))
+
+  return clock
 }
 
 const start = ($: any) => $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' } as any)
 const say = ($: any, text: string) => $.prompt.submit({ text, origin: { kind: 'composer' } } as any)
+const turnEnds = ($: any) => $.turn.complete({ reason: 'answer', answer: 'done', durationMs: 1000, isAborted: false, turnId: 't' } as any)
 
 describe('open-tray', () => {
   test('what Claude opens lands in "Made this session" and opens again from it', async ($, on) => {
@@ -181,7 +221,7 @@ describe('open-tray', () => {
     const ui = await $.ui.mount(PANE)
 
     expect(await ui.find({ type: 'Text', text: /^Nothing here yet\.$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /following your work/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /PLAYER 1 READY/ })).toBeDefined()
     await ui.unmount()
   })
 
@@ -246,6 +286,159 @@ describe('open-tray', () => {
     expect(ran).toContainEqual(['open', '-R', '/w/evil.command'])
     expect(ran.some(argv => argv.length === 2 && argv[0] === 'open')).toBe(false)
   })
+
+  test('listen plays a film\'s sound in the tray, with pause, jump and stop as buttons', async ($, on) => {
+    const spawned: string[][] = []
+    const toasts: string[] = []
+    const clock = engine(on, { rules: null, spawned, toasts })
+    await start($)
+    await $.tool.call({ tool: 'mcp__open-tray__offer', target: '/w/films/cut.mp4' } as any)
+    const ui = await $.ui.mount(PANE)
+    expect(await ui.find({ type: 'Text', text: /NOW PLAYING/ })).toBeUndefined()
+
+    await ui.press({ key: 'audio' })
+    expect(spawned.at(-1)).toEqual(['ffplay', '-nodisp', '-vn', '-autoexit', '-loglevel', 'error', '-ss', '0.00', '/w/films/cut.mp4'])
+    expect(await ui.find({ type: 'Text', text: /^NOW PLAYING$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^0:00 \/ 10:00$/ })).toBeDefined()
+
+    await clock.advance(30_000)
+    expect(await ui.find({ type: 'Text', text: /^0:30 \/ 10:00$/ })).toBeDefined()
+
+    await ui.press({ key: 'play' })
+    expect(await ui.find({ type: 'Text', text: /^PAUSED$/ })).toBeDefined()
+    await ui.press({ key: 'ahead-60' })
+    expect(await ui.find({ type: 'Text', text: /^1:30 \/ 10:00$/ })).toBeDefined()
+    expect(spawned.length).toBe(1)
+
+    await ui.press({ key: 'play' })
+    expect(spawned.at(-1)).toContain('90.00')
+    await ui.press({ key: 'back-10' })
+    expect(spawned.at(-1)).toContain('80.00')
+
+    await ui.press({ key: 'stop' })
+    expect(await ui.find({ type: 'Text', text: /NOW PLAYING|PAUSED/ })).toBeUndefined()
+
+    // Not a film or audio file: nothing plays. (The kit cannot close a pane,
+    // so "closing the pane stops it" is checked live.)
+    await $.tool.call({ tool: 'mcp__open-tray__offer', target: '/w/notes/plan.pdf' } as any)
+    await ui.press({ key: 'audio' })
+    expect(toasts).toContain('Listen works on a film or an audio file')
+    expect(spawned.length).toBe(3)
+    await ui.unmount()
+  })
+
+  test('a film, picture or page Claude writes lands in the tray; a note it writes does not', async ($, on) => {
+    engine(on, { rules: null })
+    await start($)
+    await $.tool.call({ tool: 'Write', file_path: '/w/out/logo.svg', content: '<svg/>' } as any)
+    await $.tool.call({ tool: 'Write', file_path: '/w/out/review.html', content: '<p>' } as any)
+    await $.tool.call({ tool: 'Write', file_path: '/w/NOTES.md', content: '# hi' } as any)
+    const ui = await $.ui.mount(PANE)
+
+    expect(await ui.find({ type: 'Button', text: /logo\.svg/ })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: /review\.html/ })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: /NOTES\.md/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test("new files the main loop prints land; a subagent's printed paths do not, but what it opens does", async ($, on) => {
+    const state = { text: '' }
+    engine(on, { rules: null, mtime: 9_900_000, get bashText() { return state.text } } as any)
+    await start($)
+    state.text = 'wrote /w/out/sub.png'
+    await $.tool.call({ tool: 'Bash', command: 'make shots', agentId: 'sub-1' } as any)
+    await $.tool.call({ tool: 'Bash', command: 'open /w/out/opened.pdf', agentId: 'sub-1' } as any)
+    state.text = 'wrote /w/out/main.png and /w/out/page.html'
+    await $.tool.call({ tool: 'Bash', command: 'make shots' } as any)
+    const ui = await $.ui.mount(PANE)
+
+    expect(await ui.find({ type: 'Button', text: /sub\.png/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Button', text: /opened\.pdf/ })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: /main\.png/ })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: /page\.html/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('without rules: a prompt naming a folder switches at once, and work inside it holds', async ($, on) => {
+    engine(on, { rules: null, folders: './context-gauge\n./context-gauge/hooks\n./open-tray\n./open-tray/hooks\n./src\n' })
+    await start($)
+    const ui = await $.ui.mount(PANE)
+
+    await say($, "let's polish context-gauge today")
+    expect(await ui.find({ type: 'Text', text: /^ ◆ context-gauge $/ })).toBeDefined()
+
+    // "hooks" is in two places and "src" is generic: neither names an area.
+    await say($, 'fix the hooks in src')
+    expect(await ui.find({ type: 'Text', text: /^ ◆ context-gauge $/ })).toBeDefined()
+
+    for (const name of ['a', 'b', 'c']) await $.tool.call({ tool: 'Read', file_path: `/w/context-gauge/hooks/${name}.ts` } as any)
+    expect(await ui.find({ type: 'Text', text: /^ ◆ context-gauge $/ })).toBeDefined()
+
+    await say($, 'now open-tray/hooks')
+    expect(await ui.find({ type: 'Text', text: /^ ◆ open-tray\/hooks $/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a server can be stopped from the tray, then restarted or removed', async ($, on) => {
+    const ran: string[][] = []
+    const prompts: string[] = []
+    engine(on, { rules: null, ran, prompts, bashText: '  ➜  Local:   http://localhost:5173/' })
+    await start($)
+    await $.tool.call({ tool: 'Bash', command: 'pnpm dev' } as any)
+    const ui = await $.ui.mount(PANE)
+
+    await ui.press({ key: 'stop-0' })
+    expect(ran).toContainEqual(['lsof', '-nP', '-t', '-iTCP:5173', '-sTCP:LISTEN'])
+    expect(ran).toContainEqual(['kill', '-TERM', '4242'])
+    expect(await ui.find({ type: 'Text', text: /^○ $/ })).toBeDefined()
+
+    await ui.press({ key: 'restart-0' })
+    expect(prompts.some(p => /localhost:5173.*Restart it/.test(p))).toBe(true)
+
+    await ui.press({ key: 'drop-0' })
+    expect(await ui.find({ type: 'Text', text: /^Local servers$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('after a big move, once no subagent is at it, the Recap tab says what we did, what waits on you, and what is next', async ($, on) => {
+    const forks: string[] = []
+    const agents = [{ status: 'running' }]
+    const clock = engine(on, { rules: null, forks, agents })
+    await start($)
+    for (let i = 0; i < 8; i++) {
+      await $.tool.call({ tool: 'Edit', file_path: `/w/src/f${i}.ts`, old_string: 'a', new_string: 'b', agentId: 'sub-1' } as any)
+    }
+    await turnEnds($)
+    await clock.settle()
+    expect(forks.length).toBe(0)
+
+    agents.length = 0
+    await turnEnds($)
+    await clock.settle()
+    expect(forks.length).toBe(1)
+
+    const ui = await $.ui.mount(PANE)
+    expect(await ui.find({ type: 'Text', text: /^ ●$/ })).toBeDefined()
+    await ui.press({ key: 'tab-recap' })
+    expect(await ui.find({ type: 'Text', text: /^ ●$/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^WHAT WE DID$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Built the player$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Try it on a real film$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Phase 2: the recap$/ })).toBeDefined()
+
+    await ui.press({ key: 'todo-0' })
+    expect(await ui.find({ type: 'Button', text: /\[x\]/ })).toBeDefined()
+
+    // A small turn after it writes nothing; "recap now" always does.
+    await turnEnds($)
+    await clock.settle()
+    expect(forks.length).toBe(1)
+    await ui.press({ key: 'recap-now' })
+    expect(forks.length).toBe(2)
+    expect(await ui.find({ type: 'Button', text: /older/ })).toBeDefined()
+    await ui.unmount()
+  })
+
 })
 
 describe('untrusted rules', () => {

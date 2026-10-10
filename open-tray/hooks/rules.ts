@@ -3,9 +3,10 @@
 // one, the area is the folder Claude has been working in, and "related" is
 // the newest media, pages and PDFs inside it.
 //
-// Rules are read from the project's own `.claude/tray.json`, else from the
-// person's own `~/.claude/open-tray/rules/<repo folder name>.json`. The plugin
-// ships no project's rules, only `examples/tray.json` to copy from.
+// Rules are read from the person's own `~/.claude/open-tray/rules/<repo folder
+// name>.json`, which always wins, else from the project's `.claude/tray.json`
+// once trusted (register.tsx). The plugin ships no project's rules, only
+// `examples/tray.json` to copy from.
 
 import type { TrayAction, TrayItem, TrayKind } from '../types'
 
@@ -31,7 +32,21 @@ export type Rules = {
 }
 
 const DEFAULT_SKIP = ['/node_modules/', '/.git/', '/dist/', '/build/', '/.next/', '/archive/', '/.cache/']
-const DEFAULT_NAMES = ['*.mp4', '*.mov', '*.webm', '*.mp3', '*.wav', '*.m4a', '*.png', '*.jpg', '*.jpeg', '*.gif', '*.pdf', '*.html']
+/**
+ * What the tray picks up by itself: films, audio, images, pages and PDFs, one
+ * list for what Claude writes or prints and for the newest-in-this-folder scan.
+ * Notes and data (`.md`, `.json`, `.txt`) show when offered, but never on
+ * their own: Claude touches those all day.
+ */
+export const SHOWN = ['mp4', 'mov', 'webm', 'm4v', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'html', 'htm', 'pdf']
+const DEFAULT_NAMES = SHOWN.map(ext => `*.${ext}`)
+
+/** Absolute or ~ paths to shown files, as a command prints them. */
+export const SHOWN_PATH = new RegExp(`(?:~|/)[^\\s'"\`<>|;,()\\]]+\\.(?:${SHOWN.join('|')})\\b`, 'gi')
+
+export function isShown(path: string): boolean {
+  return SHOWN.includes(path.split('.').pop()?.toLowerCase() ?? '')
+}
 
 export const KINDS: Record<string, TrayKind> = {
   mp4: 'video', mov: 'video', webm: 'video', m4v: 'video',
@@ -112,14 +127,80 @@ export function areaIn(text: string, rules: Rules | null): Area | null {
   return null
 }
 
-/** Without rules: the folder (two levels under the repo root) a path sits in. */
-export function folderArea(path: string, root: string): Area | null {
+/**
+ * Without rules: the folder (two levels under the repo root) a path sits in.
+ * A path inside the current area's folder counts for that area, so naming
+ * `context-gauge` holds while Claude works in `context-gauge/hooks`.
+ */
+export function folderArea(path: string, root: string, current: string | null = null): Area | null {
   if (!path.startsWith(`${root}/`)) return null
-  const parts = path.slice(root.length + 1).split('/').slice(0, -1).slice(0, 2)
+  const rel = path.slice(root.length + 1)
+  if (current && rel.startsWith(`${current}/`)) return folderKey(current)
+  const parts = rel.split('/').slice(0, -1).slice(0, 2)
   if (parts.length === 0) return null
-  const key = parts.join('/')
 
+  return folderKey(parts.join('/'))
+}
+
+function folderKey(key: string): Area {
   return { key, label: key, values: { '1': key, '1n': key } }
+}
+
+// Folder names too common to mean one place when a prompt says them.
+const GENERIC = new Set(
+  ('src lib app apps doc docs test tests spec specs type types hook hooks asset assets public script scripts component components ' +
+    'util utils helper helpers example examples build dist bin config configs package packages style styles image images img media ' +
+    'data fixtures tmp temp out output vendor internal core common shared server client api page pages view views plugin plugins ' +
+    'module modules main source sources static web site')
+    .split(' '),
+)
+
+/**
+ * Without rules: the folder a prompt names, from the repo's folders (paths
+ * two levels deep at most). A name counts when it is one folder's alone, not
+ * a generic one (`hooks`, `src`), and four letters or more; a path
+ * (`open-tray/hooks`) counts too. The first named in the text wins.
+ */
+export function folderIn(text: string, folders: string[]): Area | null {
+  const lower = text.slice(0, MAX_TEXT).toLowerCase()
+  const byName = new Map<string, string[]>()
+  for (const folder of folders) {
+    const name = baseName(folder).toLowerCase()
+    byName.set(name, [...(byName.get(name) ?? []), folder])
+  }
+  let best: { at: number; folder: string } | null = null
+  const consider = (word: string, folder: string) => {
+    const at = wordAt(lower, word)
+    if (at >= 0 && (!best || at < best.at)) best = { at, folder }
+  }
+  for (const folder of folders) {
+    if (folder.includes('/')) consider(folder.toLowerCase(), folder)
+  }
+  for (const [name, list] of byName) {
+    if (list.length === 1 && name.length >= 4 && !GENERIC.has(name)) consider(name, list[0]!)
+  }
+  const found = best as { at: number; folder: string } | null
+
+  return found ? folderKey(found.folder) : null
+}
+
+// Where `word` stands alone in `text` (letters, digits, - and _ count as part of a word), or -1.
+function wordAt(text: string, word: string): number {
+  let from = 0
+  for (;;) {
+    const at = text.indexOf(word, from)
+    if (at < 0) return -1
+    const before = text[at - 1] ?? ' '
+    const after = text[at + word.length] ?? ' '
+    if (!/[\w-]/.test(before) && !/[\w-]/.test(after)) return at
+    from = at + 1
+  }
+}
+
+/** The repo's folders, two levels deep, without hidden or skipped ones. */
+export function foldersScript(root: string): string {
+  const prune = ['node_modules', 'dist', 'build', 'archive', '.*'].map(n => `-name ${quote(n)}`).join(' -o ')
+  return `cd ${quote(root)} && find . -mindepth 1 -maxdepth 2 \\( ${prune} \\) -prune -o -type d -print 2>/dev/null | head -3000`
 }
 
 export function tagOf(text: string, rules: Rules | null): string | null {

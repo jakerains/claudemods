@@ -1,20 +1,30 @@
-// Open Tray: a pane of things to look at or listen to, in two sections.
+// POWERTRAY (the open-tray mod): a pane of things to look at or listen to,
+// with two tabs.
 //
-// - Made this session: what Claude opened, rendered or handed over, plus
-//   anything the person kept. These stay until removed.
+// Tray:
+// - Made this session: what Claude opened, wrote, rendered or handed over,
+//   plus anything the person kept. These stay until removed.
 // - Related to what we're on: found for the area being worked on (a module, a
 //   folder) and swapped out when the area changes. A project's rules file says
 //   how to spot its areas and where their good stuff lives (rules.ts); without
-//   one, the area is the folder Claude works in.
+//   one, the area is the folder Claude works in, or one a prompt names.
+// - Local servers Claude started, each with stop, restart and remove.
+// Recap (recap.ts): after a big move, what we did, what waits on the person,
+// and what comes next.
+// A player card (player.ts) shows above both while a film's sound or an audio
+// file plays.
 //
 // Nothing here is project-specific: projects bring their own rules (a repo's
 // `.claude/tray.json`, or `~/.claude/open-tray/rules/<repo>.json`).
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderChildren } from 'claude-code'
+import type { EngineInterface, Register, RenderChildren, Timer } from 'claude-code'
 
-import type { Related, RelatedGroup, ReviewPlayer, TrayAction, TrayItem } from '../types'
+import type { Recaps, Related, RelatedGroup, ReviewPlayer, TrayAction, TrayItem, Work } from '../types'
+import { clockText, ffplayArgs, ffprobeArgs, landing, lengthIn, positionOf } from './player'
+import { ASK, BIG_AGENTS, BIG_FILES, KEEP, isBig, parse } from './recap'
 import {
+  SHOWN_PATH,
   actionPattern,
   actionsFor,
   areaIn,
@@ -22,7 +32,10 @@ import {
   dirsScript,
   findScript,
   folderArea,
+  folderIn,
+  foldersScript,
   groupItems,
+  isShown,
   kindOf,
   relatedPlan,
   rulesPaths,
@@ -31,6 +44,7 @@ import {
   tagOf,
 } from './rules'
 import type { Area, Rules } from './rules'
+import { ICONS, KIND_COLORS, NAME, NAME_COLORS, THEME } from './theme'
 
 const PANE = 'open-tray'
 const MAX_ITEMS = 50
@@ -40,8 +54,11 @@ const CHECK_MS = 20_000
 const SWITCH_VOTES = 3
 const WINDOW = 8
 const REFRESH_GAP_MS = 60_000
+const FOLDERS_MS = 60_000
 
 const NO_RELATED: Related = { area: null, label: '', groups: [], actions: [], suggested: [] }
+const NO_RECAPS: Recaps = { list: [], view: 0, isWriting: false, isNew: false, ticked: [] }
+const NO_WORK: Work = { agents: 0, files: [] }
 
 // Held by the host, so the tray survives a hot reload of this file.
 const items = atom({ plugin: 'open-tray', key: 'items' } as const, [])
@@ -50,34 +67,15 @@ const players = atom({ plugin: 'open-tray', key: 'players' } as const, [])
 const related = atom({ plugin: 'open-tray', key: 'related' } as const, NO_RELATED)
 const signals = atom({ plugin: 'open-tray', key: 'signals' } as const, [])
 const hidden = atom({ plugin: 'open-tray', key: 'hidden' } as const, [])
+const tab = atom({ plugin: 'open-tray', key: 'tab' } as const, 'tray')
+const playing = atom({ plugin: 'open-tray', key: 'playing' } as const, null)
+const tick = atom({ plugin: 'open-tray', key: 'tick' } as const, 0)
+const recaps = atom({ plugin: 'open-tray', key: 'recaps' } as const, NO_RECAPS)
+const work = atom({ plugin: 'open-tray', key: 'work' } as const, NO_WORK)
 
-const ICONS: Record<TrayItem['kind'], string> = {
-  video: '▶', audio: '♪', image: '▣', page: '◧', doc: '≡', folder: '▤', url: '↗', other: '·',
-}
-// One small palette: a violet accent, soft greys, and a colour per kind.
-const THEME = {
-  accent: '#a78bfa',
-  onAccent: '#14121c',
-  picked: '#26243a',
-  sub: '#b8b5c8',
-  faint: '#6e6a80',
-  rule: '#3a3750',
-  go: '#4ade80',
-  stop: '#f87171',
-}
-const KIND_COLORS: Record<TrayItem['kind'], string> = {
-  video: '#f472b6',
-  audio: '#22d3ee',
-  image: '#fbbf24',
-  page: '#60a5fa',
-  doc: '#cbd5e1',
-  folder: '#34d399',
-  url: '#38bdf8',
-  other: '#94a3b8',
-}
-const MEDIA_PATH = /(?:~|\/)[^\s'"`<>|;,()\]]+\.(?:mp4|mov|webm|m4v|mp3|wav|m4a|aac|flac|ogg|png|jpe?g|gif|webp|pdf)\b/gi
 const LOCAL_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|[\w.-]+\.localhost)(?::\d+)?(?:\/[^\s'"`)\]<>]*)?/g
 const OUTPUT_FILE = /\/[^\s'"`]+\/tasks\/[\w-]+\.output\b/
+const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 
 // This load's view of the project: its root and rules, read at session start.
 let root = ''
@@ -85,22 +83,36 @@ let rules: Rules | null = null
 // A repo's own rules file waiting for /tray trust: its hash and where it is.
 let untrusted: { path: string; hash: string } | null = null
 let lastRefreshAt = 0
+// The repo's folders, for prompts that name one (no rules only).
+let folders: { at: number; list: string[] } = { at: 0, list: [] }
+// The player's child lives as long as its stream is read, so the handle is
+// here; a reload kills the child, and session.start clears what the pane shows.
+let child: AsyncGenerator<unknown, unknown> | null = null
+// Bumped on every start and stop, so a stream that ends after being replaced
+// does not clear the player that replaced it.
+let generation = 0
+let ticker: Timer | null = null
+let hasFfplay: boolean | null = null
+// One recap at a time; a reload ends the call, so a module variable is enough.
+let isRecapping = false
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     root = (await $.session.repo())?.root ?? (await $.session.root())
     rules = await loadRules($, root)
+    await resetPlayer($)
+    await resetRecap($)
     await $.command.register({
       name: 'tray',
-      description: "Show the Open Tray: things made for you this session, and things related to what we are working on (trust: use this repo's .claude/tray.json)",
-      argumentHint: '[trust|untrust]',
+      description: `Show ${NAME}: what was made for you this session, things related to what we are on, and a recap of big moves (recap: write one now; trust: use this repo's .claude/tray.json)`,
+      argumentHint: '[recap|trust|untrust]',
       immediate: true,
     })
     await $.tool.register({
       name: 'offer',
       description:
-        "Put a file, folder or local URL in the user's Open Tray pane, where they open it, reveal it in Finder or play a film's audio alone. " +
+        `Put a file, folder or local URL in the user's ${NAME} pane (Open Tray), where they open it, reveal it in Finder or play a film's sound. ` +
         'Use it for anything you produced for the user to look at, listen to or read (renders, audio takes, screenshots, review sheets, ' +
         'scripts, local review URLs), and with suggest: true for existing things you think they will want for the current task. ' +
         'Paths must be absolute.',
@@ -126,7 +138,7 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     const result = await next(e)
     if (e.origin.kind === 'composer') {
-      const area = areaIn(e.text, rules)
+      const area = areaIn(e.text, rules) ?? (rules?.areas?.length ? null : folderIn(e.text, await folderList($)))
       if (area) await vote($, area, true)
     }
 
@@ -146,11 +158,11 @@ export const register: Register = on => {
     }
     if (input.suggest === true) {
       await update($, related, r => ({ ...r, suggested: [item, ...r.suggested.filter(s => s.target !== item.target)].slice(0, 8) }))
-      return { result: `Suggested in the Open Tray: ${item.label}` }
+      return { result: `Suggested in ${NAME}: ${item.label}` }
     }
     await addItem($, item, true)
 
-    return { result: `In the Open Tray: ${item.label}` }
+    return { result: `In ${NAME}: ${item.label}` }
   })
 
   on('tool.call', async ($, e, next) => {
@@ -159,13 +171,21 @@ export const register: Register = on => {
       return result
     }
     const input = e as unknown as Record<string, unknown>
+    const isMain = !e.agentId
 
-    // The files Claude works on vote for the area.
-    if (!e.agentId) {
-      const path = String(input.file_path ?? input.path ?? input.notebook_path ?? '')
-      if (path.startsWith('/')) {
-        const area = areaIn(path, rules) ?? (rules?.areas?.length ? null : folderArea(path, root))
+    const path = String(input.file_path ?? input.path ?? input.notebook_path ?? '')
+    if (path.startsWith('/')) {
+      // The files the main loop works on vote for the area.
+      if (isMain) {
+        const current = (await read($, related)).area
+        const area = areaIn(path, rules) ?? (rules?.areas?.length ? null : folderArea(path, root, current))
         if (area) await vote($, area, false)
+      }
+      // Changed files, anyone's, make a stretch a big move; a shown file Claude writes lands.
+      if (EDIT_TOOLS.has(e.tool)) await noteFile($, path)
+      if (e.tool === 'Write' && isShown(path)) {
+        const item = await itemFor($, path)
+        if (item) await addItem($, item, false)
       }
     }
 
@@ -173,21 +193,25 @@ export const register: Register = on => {
       const command = String(input.command ?? '')
       const output = typeof result.text === 'string' ? result.text : ''
       const cwd = await $.session.cwd()
+      // What anyone opens is meant to be seen.
       for (const target of openTargets(command, cwd)) {
         const item = await itemFor($, target)
         if (item) await addItem($, item, false)
       }
-      const now = await $.clock.now()
-      for (const path of new Set(output.match(MEDIA_PATH) ?? [])) {
-        const full = await expandHome($, path)
-        try {
-          const stat = await $.fs.stat(full)
-          if (stat.kind === 'file' && now - stat.mtimeMs < FRESH_MS) {
-            const item = await itemFor($, full)
-            if (item) await addItem($, item, false)
+      // What the main loop prints, if it is new; a subagent's listings are its own business.
+      if (isMain) {
+        const now = await $.clock.now()
+        for (const path of new Set(output.match(SHOWN_PATH) ?? [])) {
+          const full = await expandHome($, path)
+          try {
+            const stat = await $.fs.stat(full)
+            if (stat.kind === 'file' && now - stat.mtimeMs < FRESH_MS) {
+              const item = await itemFor($, full)
+              if (item) await addItem($, item, false)
+            }
+          } catch {
+            // Printed, but not on disk.
           }
-        } catch {
-          // Printed, but not on disk.
         }
       }
       if (startsServer(command, rules)) {
@@ -205,15 +229,33 @@ export const register: Register = on => {
     return result
   })
 
-  // New renders land during a turn; look again once it ends (at most once a minute).
+  on('agent.spawn', async ($, e, next) => {
+    const result = await next(e)
+    if (!result.deny) await noteAgent($)
+
+    return result
+  })
+
+  // New renders land during a turn; look again once it ends (at most once a
+  // minute). A big move gets its recap, off the hook's own time.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    if (e.agentId) return result
     const r = await read($, related)
     const now = await $.clock.now()
-    if (!e.agentId && r.area && now - lastRefreshAt > REFRESH_GAP_MS) {
-      const area = areaFromKey(r.area, await read($, signals))
+    if (r.area && now - lastRefreshAt > REFRESH_GAP_MS) {
+      const area = areaFromKey(r.area)
       if (area) await refresh($, area)
     }
+    if (e.reason === 'answer') $.clock.after(0, () => void afterTurn($))
+
+    return result
+  })
+
+  // Closing the pane stops the sound.
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    const result = await next(e)
+    await stopSound($)
 
     return result
   })
@@ -221,147 +263,292 @@ export const register: Register = on => {
   on('command.run', { command: 'tray' }, async ($, e) => {
     const word = e.args.trim().toLowerCase()
     if (word === 'trust' || word === 'untrust') return { text: await trustRepo($, word === 'trust') }
-    const opened = await $.ui.open({ id: PANE, title: 'Open Tray', focus: true })
+    if (word === 'recap') await showTab($, 'recap')
+    const opened = await $.ui.open({ id: PANE, title: NAME, focus: true })
+    if (word === 'recap') {
+      void writeRecap($, true)
+      return { text: opened.isPlaced ? `${NAME}: writing a recap.` : `${NAME} could not be placed; widen the terminal.` }
+    }
     const count = (await read($, items)).length
     const r = await read($, related)
 
     const note = untrusted ? ` This repo has rules (${untrusted.path}); review them, then /tray trust to use them.` : ''
     return {
       text: opened.isPlaced
-        ? `Open Tray: ${count} made this session${r.area ? `, ${r.label} related` : ''}.${note}`
-        : 'Open Tray could not be placed; widen the terminal.',
+        ? `${NAME}: ${count} made this session${r.area ? `, ${r.label} related` : ''}.${note}`
+        : `${NAME} could not be placed; widen the terminal.`,
     }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const mine = await read($, items)
-    const r = await read($, related)
-    const away = new Set(await read($, hidden))
-    const live = await read($, players)
-    const now = await $.clock.now()
     const columns = e.props.bodyColumns
-    const rows = flatten(mine, r, away)
-    const pick = Math.min(await read($, selected), Math.max(0, rows.length - 1))
-    const stopped = live.find(p => !p.isAlive)
-    const mineCount = rows.filter(row => row.place === 'mine').length
-    const areaCount = rows.length - mineCount
+    const now = await $.clock.now()
+    const r = await read($, related)
+    const showing = await read($, tab)
+    const rc = await read($, recaps)
+    const sound = await read($, playing)
+    await read($, tick) // Redraws the player's clock each second while it plays.
 
-    const title = (text: string, count: number) => (
-      <Box flexDirection="row" marginTop={1}>
-        <Text bold color={THEME.accent}>{text.toUpperCase()}</Text>
-        <Text color={THEME.faint}>{` ${count} `}</Text>
-        <Text color={THEME.rule}>{'─'.repeat(Math.max(0, columns - text.length - String(count).length - 2))}</Text>
-      </Box>
-    )
-
-    const line = (index: number) => {
-      const row = rows[index]!
-      const isPicked = index === pick
-      const bar = <Text color={THEME.accent}>{isPicked ? '▌' : ' '}</Text>
-      if (row.kind === 'action') {
-        return (
-          <Box flexDirection="row" backgroundColor={isPicked ? THEME.picked : undefined}>
-            {bar}
-            <Text color={THEME.go}>{' ⏵ '}</Text>
-            <Button key={`row-${index}`} plain label={clip(row.action.label, columns - 5)} onPress={() => void runRow($, index)} />
-          </Box>
-        )
-      }
-      const meta = `${row.item.tag ? `${row.item.tag}  ` : ''}${ago(now - row.item.addedAt)}`
+    const title = (text: string, count?: number) => {
+      const tail = count === undefined ? '' : ` ${count}`
       return (
-        <Box flexDirection="row" justifyContent="space-between" width={columns} backgroundColor={isPicked ? THEME.picked : undefined}>
-          <Box flexDirection="row" flexShrink={1}>
-            {bar}
-            <Text color={KIND_COLORS[row.item.kind]}>{` ${ICONS[row.item.kind]} `}</Text>
-            <Button
-              key={`row-${index}`}
-              plain
-              label={clip(row.item.label, Math.max(8, columns - meta.length - 7))}
-              onPress={() => void runRow($, index)}
-            />
-          </Box>
-          <Text color={THEME.faint}>{` ${meta} `}</Text>
+        <Box flexDirection="row" marginTop={1}>
+          <Text color={THEME.grid}>{'▸ '}</Text>
+          <Text bold color={THEME.chrome}>{text.toUpperCase()}</Text>
+          <Text color={THEME.faint}>{`${tail} `}</Text>
+          <Text color={THEME.rule}>{'─'.repeat(Math.max(0, columns - text.length - tail.length - 3))}</Text>
         </Box>
       )
     }
 
-    // The area's rows, under a small heading per group.
-    const areaLines: RenderChildren[] = []
-    let lastGroup = ''
-    rows.forEach((row, index) => {
-      if (row.place !== 'area') return
-      if (row.group !== lastGroup) {
-        areaLines.push(<Text color={THEME.sub}>{`  ${row.group}`}</Text>)
-        lastGroup = row.group
-      }
-      areaLines.push(line(index))
-    })
-
-    return (
-      <Box flexDirection="column" width={columns}>
-        <Box flexDirection="row" justifyContent="space-between" width={columns}>
-          <Text bold>
-            <Text color={THEME.accent}>{'◆ '}</Text>
-            {'Open Tray'}
-          </Text>
-          {r.label ? (
-            <Text backgroundColor={THEME.accent} color={THEME.onAccent} bold>{` ${r.label} `}</Text>
-          ) : (
-            <Text color={THEME.faint}>{'following your work'}</Text>
-          )}
+    const header = (
+      <Box flexDirection="row" justifyContent="space-between" width={columns}>
+        <Box flexDirection="row">
+          <Text color={THEME.grid}>{'▚▞ '}</Text>
+          {[...NAME].map((letter, i) => (
+            <Text bold color={NAME_COLORS[i % NAME_COLORS.length]}>{letter}</Text>
+          ))}
         </Box>
-
-        {rows.length === 0 && (
-          <Box flexDirection="column" marginTop={1} paddingX={1}>
-            <Text color={THEME.sub}>{'Nothing here yet.'}</Text>
-            <Text color={THEME.faint} wrap="wrap">
-              {'Films, audio, images and pages I make for you land here. As we work, things related to what we are on show up below.'}
-            </Text>
-          </Box>
-        )}
-
-        {mineCount > 0 && title('Made this session', mineCount)}
-        {rows.map((row, index) => (row.place === 'mine' ? line(index) : null))}
-
-        {areaCount > 0 && title(r.label || 'Related', areaCount)}
-        {areaLines}
-
-        {rows.length > 0 && (
-          <Box flexDirection="row" flexWrap="wrap" marginTop={1}>
-            <Button key="open" plain hotkey="o" label="open   " onPress={() => void runRow($, pick)} />
-            <Button key="finder" plain hotkey="f" label="Finder   " onPress={() => void act($, pick, 'finder')} />
-            <Button key="audio" plain hotkey="a" label="audio   " onPress={() => void act($, pick, 'audio')} />
-            <Button key="keep" plain hotkey="p" label="keep   " onPress={() => void keep($, pick)} />
-            <Button key="remove" plain hotkey="x" label="remove   " onPress={() => void remove($, pick)} />
-            <Button key="down" plain hotkey="j" label="down   " onPress={() => void move($, 1)} />
-            <Button key="up" plain hotkey="k" label="up" onPress={() => void move($, -1)} />
-          </Box>
-        )}
-
-        {live.length > 0 && (
-          <Box flexDirection="column" borderStyle="round" borderColor={THEME.rule} paddingX={1} marginTop={1}>
-            <Text bold color={THEME.sub}>{'Local servers'}</Text>
-            {live.map((player, index) => (
-              <Box flexDirection="row">
-                <Text color={player.isAlive ? THEME.go : THEME.stop}>{player.isAlive ? '● ' : '○ '}</Text>
-                <Button
-                  key={`player-${index}`}
-                  plain
-                  dimColor={!player.isAlive}
-                  label={`${player.tag ?? 'player'}  ${player.url}`}
-                  onPress={() => void $.process.run(['open', player.url])}
-                />
-                {!player.isAlive && <Text color={THEME.stop}>{'  stopped'}</Text>}
-              </Box>
-            ))}
-            {stopped && (
-              <Button key="restart" plain hotkey="r" label={`restart ${stopped.tag ?? stopped.url}`} onPress={() => void restart($, stopped)} />
-            )}
-          </Box>
+        {r.label ? (
+          <Text backgroundColor={THEME.accent} color={THEME.onAccent} bold>{` ◆ ${r.label} `}</Text>
+        ) : (
+          <Text color={THEME.faint}>{'PLAYER 1 READY'}</Text>
         )}
       </Box>
     )
+
+    const tabs = (
+      <Box flexDirection="row" marginTop={1}>
+        <Text color={THEME.accent}>{showing === 'tray' ? '▸' : ' '}</Text>
+        <Button key="tab-tray" plain hotkey="1" dimColor={showing !== 'tray'} label="TRAY   " onPress={() => void showTab($, 'tray')} />
+        <Text color={THEME.accent}>{showing === 'recap' ? '▸' : ' '}</Text>
+        <Button key="tab-recap" plain hotkey="2" dimColor={showing !== 'recap'} label="RECAP" onPress={() => void showTab($, 'recap')} />
+        <Text color={THEME.accent}>{rc.isNew ? ' ●' : ''}</Text>
+        <Text color={THEME.faint}>{rc.isWriting ? '  writing…' : ''}</Text>
+      </Box>
+    )
+
+    const body = showing === 'recap' ? drawRecap() : await drawTray()
+
+    return (
+      <Box flexDirection="column" width={columns}>
+        {header}
+        {tabs}
+        {sound && drawPlayer(sound)}
+        {body}
+      </Box>
+    )
+
+    function drawPlayer(p: NonNullable<typeof sound>) {
+      const inner = Math.max(10, columns - 4)
+      const at = positionOf(p, now)
+      const time = p.duration ? `${clockText(at)} / ${clockText(p.duration)}` : clockText(at)
+      const filled = p.duration ? Math.round(inner * Math.min(1, at / p.duration)) : 0
+      const isPaused = p.startedAt === null
+      return (
+        <Box flexDirection="column" borderStyle="double" borderColor={THEME.accent} paddingX={1} marginTop={1} width={columns}>
+          <Box flexDirection="row" justifyContent="space-between" width={inner}>
+            <Text bold color={THEME.chrome}>{isPaused ? 'PAUSED' : 'NOW PLAYING'}</Text>
+            <Text color={THEME.sub}>{time}</Text>
+          </Box>
+          <Text color={KIND_COLORS.audio}>{`♪ ${clip(p.label, inner - 2)}`}</Text>
+          {p.duration ? (
+            <Box flexDirection="row">
+              {filled > 0 && <Text color={THEME.accent}>{'█'.repeat(filled)}</Text>}
+              {inner - filled > 0 && <Text color={THEME.rule}>{'░'.repeat(inner - filled)}</Text>}
+            </Box>
+          ) : null}
+          <Box flexDirection="row" flexWrap="wrap">
+            <Button
+              key="play"
+              plain
+              label={isPaused ? '▶ play   ' : '‖ pause   '}
+              onPress={() => void (isPaused ? resume($) : pause($))}
+            />
+            <Button key="back-60" plain label="-1m   " onPress={() => void jump($, -60)} />
+            <Button key="back-10" plain label="-10s   " onPress={() => void jump($, -10)} />
+            <Button key="ahead-10" plain label="+10s   " onPress={() => void jump($, 10)} />
+            <Button key="ahead-60" plain label="+1m   " onPress={() => void jump($, 60)} />
+            <Button key="stop" plain label="■ stop" onPress={() => void stopSound($)} />
+          </Box>
+        </Box>
+      )
+    }
+
+    async function drawTray() {
+      const mine = await read($, items)
+      const away = new Set(await read($, hidden))
+      const live = await read($, players)
+      const rows = flatten(mine, r, away)
+      const pick = Math.min(await read($, selected), Math.max(0, rows.length - 1))
+      const mineCount = rows.filter(row => row.place === 'mine').length
+      const areaCount = rows.length - mineCount
+
+      const line = (index: number) => {
+        const row = rows[index]!
+        const isPicked = index === pick
+        const bar = <Text color={THEME.accent}>{isPicked ? '▌' : ' '}</Text>
+        if (row.kind === 'action') {
+          return (
+            <Box flexDirection="row" backgroundColor={isPicked ? THEME.picked : undefined}>
+              {bar}
+              <Text color={THEME.go}>{' ⏵ '}</Text>
+              <Button key={`row-${index}`} plain label={clip(row.action.label, columns - 5)} onPress={() => void runRow($, index)} />
+            </Box>
+          )
+        }
+        const meta = `${row.item.tag ? `${row.item.tag}  ` : ''}${ago(now - row.item.addedAt)}`
+        return (
+          <Box flexDirection="row" justifyContent="space-between" width={columns} backgroundColor={isPicked ? THEME.picked : undefined}>
+            <Box flexDirection="row" flexShrink={1}>
+              {bar}
+              <Text color={KIND_COLORS[row.item.kind]}>{` ${ICONS[row.item.kind]} `}</Text>
+              <Button
+                key={`row-${index}`}
+                plain
+                label={clip(row.item.label, Math.max(8, columns - meta.length - 7))}
+                onPress={() => void runRow($, index)}
+              />
+            </Box>
+            <Text color={THEME.faint}>{` ${meta} `}</Text>
+          </Box>
+        )
+      }
+
+      // The area's rows, under a small heading per group.
+      const areaLines: RenderChildren[] = []
+      let lastGroup = ''
+      rows.forEach((row, index) => {
+        if (row.place !== 'area') return
+        if (row.group !== lastGroup) {
+          areaLines.push(<Text color={THEME.sub}>{`  ${row.group}`}</Text>)
+          lastGroup = row.group
+        }
+        areaLines.push(line(index))
+      })
+
+      return (
+        <Box flexDirection="column" width={columns}>
+          {rows.length === 0 && (
+            <Box flexDirection="column" marginTop={1} paddingX={1}>
+              <Text color={THEME.sub}>{'Nothing here yet.'}</Text>
+              <Text color={THEME.faint} wrap="wrap">
+                {'Films, audio, images and pages I make for you land here. As we work, things related to what we are on show up below.'}
+              </Text>
+            </Box>
+          )}
+
+          {mineCount > 0 && title('Made this session', mineCount)}
+          {rows.map((row, index) => (row.place === 'mine' ? line(index) : null))}
+
+          {areaCount > 0 && title(r.label || 'Related', areaCount)}
+          {areaLines}
+
+          {rows.length > 0 && (
+            <Box flexDirection="row" flexWrap="wrap" marginTop={1}>
+              <Button key="open" plain hotkey="o" label="open   " onPress={() => void runRow($, pick)} />
+              <Button key="finder" plain hotkey="f" label="Finder   " onPress={() => void act($, pick, 'finder')} />
+              <Button key="audio" plain hotkey="a" label="listen   " onPress={() => void act($, pick, 'audio')} />
+              <Button key="keep" plain hotkey="p" label="keep   " onPress={() => void keep($, pick)} />
+              <Button key="remove" plain hotkey="x" label="remove   " onPress={() => void remove($, pick)} />
+              <Button key="down" plain hotkey="j" label="down   " onPress={() => void move($, 1)} />
+              <Button key="up" plain hotkey="k" label="up" onPress={() => void move($, -1)} />
+            </Box>
+          )}
+
+          {live.length > 0 && (
+            <Box flexDirection="column" borderStyle="round" borderColor={THEME.rule} paddingX={1} marginTop={1}>
+              <Text bold color={THEME.sub}>{'Local servers'}</Text>
+              {live.map((server, index) => (
+                <Box flexDirection="row">
+                  <Text color={server.isAlive ? THEME.go : THEME.stop}>{server.isAlive ? '● ' : '○ '}</Text>
+                  <Button
+                    key={`server-${index}`}
+                    plain
+                    dimColor={!server.isAlive}
+                    label={`${server.tag ?? 'server'}  ${server.url}`}
+                    onPress={() => void $.process.run(['open', server.url])}
+                  />
+                  {server.isAlive ? (
+                    <Button key={`stop-${index}`} plain label="   stop" onPress={() => void stopServer($, server)} />
+                  ) : (
+                    <Button key={`restart-${index}`} plain label="   restart" onPress={() => void restartServer($, server)} />
+                  )}
+                  <Button key={`drop-${index}`} plain dimColor label="   remove" onPress={() => void dropServer($, server)} />
+                </Box>
+              ))}
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
+    function drawRecap() {
+      const shown = rc.list[Math.min(rc.view, rc.list.length - 1)]
+      const wide = Math.max(10, columns - 4)
+      const footer = (
+        <Box flexDirection="row" flexWrap="wrap" marginTop={1}>
+          <Button key="recap-now" plain hotkey="r" label="recap now   " onPress={() => void writeRecap($, true)} />
+          {rc.view < rc.list.length - 1 && (
+            <Button key="older" plain label="◂ older   " onPress={() => void update($, recaps, x => ({ ...x, view: x.view + 1 }))} />
+          )}
+          {rc.view > 0 && (
+            <Button key="newer" plain label="newer ▸   " onPress={() => void update($, recaps, x => ({ ...x, view: x.view - 1 }))} />
+          )}
+          {shown && (
+            <Text color={THEME.faint}>{`${wrote(now - shown.at)} · ${shown.isAsked ? 'asked for' : 'after a big move'}`}</Text>
+          )}
+        </Box>
+      )
+      if (!shown) {
+        return (
+          <Box flexDirection="column" marginTop={1} paddingX={1} width={columns}>
+            <Text color={THEME.sub}>{rc.isWriting ? 'Writing the recap…' : 'No recap yet.'}</Text>
+            <Text color={THEME.faint} wrap="wrap">
+              {`One writes itself after a big move (${BIG_AGENTS}+ subagents or ${BIG_FILES}+ files changed): what we did, what waits on you, and what comes next.`}
+            </Text>
+            {footer}
+          </Box>
+        )
+      }
+      return (
+        <Box flexDirection="column" width={columns}>
+          {title('What we did')}
+          {shown.did.map(text => (
+            <Box flexDirection="row">
+              <Text color={THEME.chrome}>{' · '}</Text>
+              <Box width={wide}>
+                <Text wrap="wrap">{text}</Text>
+              </Box>
+            </Box>
+          ))}
+
+          {title('Waiting on you', shown.waiting.length)}
+          {shown.waiting.length === 0 && <Text color={THEME.faint}>{'  Nothing waits on you.'}</Text>}
+          {shown.waiting.map((text, index) => {
+            const id = `${shown.at}:${index}`
+            const isDone = rc.ticked.includes(id)
+            return (
+              <Box flexDirection="row">
+                <Button key={`todo-${index}`} plain label={isDone ? ' [x] ' : ' [ ] '} onPress={() => void toggle($, id)} />
+                <Box width={wide - 2}>
+                  <Text wrap="wrap" color={isDone ? THEME.faint : undefined}>{text}</Text>
+                </Box>
+              </Box>
+            )
+          })}
+
+          {shown.next && title('Next up')}
+          {shown.next && (
+            <Box paddingX={1} width={columns}>
+              <Text wrap="wrap">{shown.next}</Text>
+            </Box>
+          )}
+          {footer}
+        </Box>
+      )
+    }
   })
 }
 
@@ -386,6 +573,18 @@ function flatten(mine: TrayItem[], r: Related, away: Set<string>): Row[] {
 
 async function rowsNow($: EngineInterface): Promise<Row[]> {
   return flatten(await read($, items), await read($, related), new Set(await read($, hidden)))
+}
+
+async function showTab($: EngineInterface, which: 'tray' | 'recap') {
+  await update($, tab, () => which)
+  if (which === 'recap') await update($, recaps, r => (r.isNew ? { ...r, isNew: false } : r))
+}
+
+async function toggle($: EngineInterface, id: string) {
+  await update($, recaps, r => ({
+    ...r,
+    ticked: r.ticked.includes(id) ? r.ticked.filter(t => t !== id) : [...r.ticked, id].slice(-100),
+  }))
 }
 
 async function runRow($: EngineInterface, index: number) {
@@ -417,7 +616,7 @@ async function openSafely($: EngineInterface, target: string, kind: string) {
   }
   const isViewable = stat.kind === 'file' ? kindOf(real) !== 'other' : stat.kind === 'dir' && !baseName(real).includes('.')
   if (!isViewable) {
-    $.ui.toast('Shown in Finder: Open Tray opens only films, audio, images, pages and documents')
+    $.ui.toast(`Shown in Finder: ${NAME} opens only films, audio, images, pages and documents`)
     await $.process.run(['open', '-R', real])
     return
   }
@@ -437,26 +636,16 @@ async function act($: EngineInterface, index: number, action: 'finder' | 'audio'
     await $.process.run(['open', '-R', item.target])
     return
   }
-  if (item.kind === 'audio') {
+  if (item.kind !== 'video' && item.kind !== 'audio') {
+    $.ui.toast('Listen works on a film or an audio file')
+    return
+  }
+  if (!(await canPlay($))) {
+    $.ui.toast('Playing in the tray needs ffplay (brew install ffmpeg); opening it instead')
     await openSafely($, item.target, item.kind)
     return
   }
-  if (item.kind !== 'video') {
-    $.ui.toast('Audio only works on a film or an audio file')
-    return
-  }
-  const tmp = ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/$/, '')
-  const out = `${tmp}/open-tray/${baseName(item.target).replace(/\.[^.]+$/, '')}.m4a`
-  await $.fs.write(`${tmp}/open-tray/.keep`, '')
-  $.ui.toast(`Pulling the audio out of ${item.label}…`)
-  const run = await $.process.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', item.target, '-vn', '-c:a', 'aac', '-b:a', '192k', out], {
-    timeoutMs: 180_000,
-  })
-  if (run.exitCode !== 0) {
-    $.ui.toast(`ffmpeg could not pull the audio: ${run.stderr.trim().split('\n').pop() ?? ''}`)
-    return
-  }
-  await $.process.run(['open', out])
+  await play($, item.target, item.label)
 }
 
 // Keep: a related item moves up to "Made this session", so it stays when the area changes.
@@ -507,9 +696,9 @@ async function addItem($: EngineInterface, item: TrayItem, isAsked: boolean) {
   await update($, selected, () => 0)
   const isUp = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced)
   if (isUp) return
-  const opened = await $.ui.open({ id: PANE, title: 'Open Tray' })
+  const opened = await $.ui.open({ id: PANE, title: NAME })
   if (!opened.isPlaced && isAsked) {
-    $.ui.toast(`Open Tray: ${item.label}  (/tray to show)`)
+    $.ui.toast(`${NAME}: ${item.label}  (/tray to show)`)
   }
 }
 
@@ -529,8 +718,23 @@ async function vote($: EngineInterface, area: Area, isClear: boolean) {
 }
 
 // Rebuilds an Area from its key: by the rules' patterns, or as a folder.
-function areaFromKey(key: string, _votes: string[]): Area | null {
+function areaFromKey(key: string): Area | null {
   return areaIn(key, rules) ?? (rules?.areas?.length ? null : { key, label: key, values: { '1': key, '1n': key } })
+}
+
+// The repo's folders, looked up again at most once a minute.
+async function folderList($: EngineInterface): Promise<string[]> {
+  const now = await $.clock.now()
+  if (root && now - folders.at > FOLDERS_MS) {
+    const run = await $.process.run(['/bin/sh', '-c', foldersScript(root)], { timeoutMs: 5_000 }).catch(() => null)
+    const list = (run?.stdout ?? '')
+      .split('\n')
+      .map(line => line.replace(/^\.\//, ''))
+      .filter(Boolean)
+    folders = { at: now, list }
+  }
+
+  return folders.list
 }
 
 async function refresh($: EngineInterface, area: Area) {
@@ -579,7 +783,7 @@ async function loadRules($: EngineInterface, projectRoot: string): Promise<Rules
   const trusted = ((await $.store.get('trusted').catch(() => undefined)) ?? {}) as Record<string, string>
   if (trusted[projectRoot] === repo.hash) return repo.rules
   untrusted = { path: '.claude/tray.json', hash: repo.hash }
-  $.ui.toast('This repo has Open Tray rules (.claude/tray.json). Review them, then /tray trust to use them.')
+  $.ui.toast(`This repo has ${NAME} rules (.claude/tray.json). Review them, then /tray trust to use them.`)
 
   return null
 }
@@ -604,19 +808,165 @@ async function trustRepo($: EngineInterface, isTrusting: boolean): Promise<strin
     delete trusted[root]
     await $.store.set('trusted', trusted)
     rules = await loadRules($, root)
-    return "Open Tray: this repo's rules are no longer used."
+    return `${NAME}: this repo's rules are no longer used.`
   }
-  if (!untrusted) return rules ? 'Open Tray: rules already in use.' : 'Open Tray: this repo has no .claude/tray.json.'
+  if (!untrusted) return rules ? `${NAME}: rules already in use.` : `${NAME}: this repo has no .claude/tray.json.`
   trusted[root] = untrusted.hash
   await $.store.set('trusted', trusted)
   rules = await loadRules($, root)
   const r = await read($, related)
-  const area = r.area ? areaFromKey(r.area, []) : null
+  const area = r.area ? areaFromKey(r.area) : null
   if (area) await refresh($, area)
-  return "Open Tray: using this repo's rules. If .claude/tray.json changes, /tray trust again."
+  return `${NAME}: using this repo's rules. If .claude/tray.json changes, /tray trust again.`
 }
 
-// ── Review players ───────────────────────────────────────────────────────────
+// ── The player ───────────────────────────────────────────────────────────────
+
+/** Is ffplay here? Asked once a load. */
+async function canPlay($: EngineInterface): Promise<boolean> {
+  if (hasFfplay === null) {
+    const probe = await $.process.run(['ffplay', '-version'], { timeoutMs: 5000 }).catch(() => null)
+    hasFfplay = probe?.exitCode === 0
+  }
+
+  return hasFfplay
+}
+
+async function play($: EngineInterface, target: string, label: string) {
+  stopChild()
+  const probe = await $.process.run(ffprobeArgs(target), { timeoutMs: 10_000 }).catch(() => null)
+  const duration = probe?.exitCode === 0 ? lengthIn(probe.stdout) : null
+  const now = await $.clock.now()
+  await update($, playing, () => ({ target, label, offset: 0, startedAt: now, duration }))
+  startSound($, target, 0)
+}
+
+async function pause($: EngineInterface) {
+  const p = await read($, playing)
+  if (!p || p.startedAt === null) return
+  stopChild()
+  const at = positionOf(p, await $.clock.now())
+  await update($, playing, () => ({ ...p, offset: at, startedAt: null }))
+}
+
+async function resume($: EngineInterface) {
+  const p = await read($, playing)
+  if (!p || p.startedAt !== null) return
+  const now = await $.clock.now()
+  await update($, playing, () => ({ ...p, startedAt: now }))
+  startSound($, p.target, p.offset)
+}
+
+/** Jumps by `seconds` (negative goes back), playing or paused. */
+async function jump($: EngineInterface, seconds: number) {
+  const p = await read($, playing)
+  if (!p) return
+  const now = await $.clock.now()
+  const at = landing(positionOf(p, now), seconds, p.duration)
+  if (p.startedAt === null) {
+    await update($, playing, () => ({ ...p, offset: at }))
+    return
+  }
+  stopChild()
+  await update($, playing, () => ({ ...p, offset: at, startedAt: now }))
+  startSound($, p.target, at)
+}
+
+async function stopSound($: EngineInterface) {
+  stopChild()
+  if (await read($, playing)) await update($, playing, () => null)
+}
+
+/** After a reload: the child died with the old module, so nothing plays. */
+async function resetPlayer($: EngineInterface) {
+  child = null
+  ticker = null
+  if (await read($, playing)) await update($, playing, () => null)
+}
+
+function startSound($: EngineInterface, target: string, offset: number) {
+  const mine = ++generation
+  const stream = $.process.spawn({ argv: ffplayArgs(target, offset) })
+  child = stream
+  if (!ticker) ticker = $.clock.every(1000, () => void update($, tick, n => n + 1))
+  void (async () => {
+    let errors = ''
+    let code: number | null = 0
+    try {
+      for await (const piece of stream) {
+        if (piece.stream === 'stderr') errors = (errors + piece.text).slice(-400)
+      }
+      code = (await stream.result).code
+    } catch {
+      code = null
+    }
+    if (mine !== generation) return // Replaced, or stopped on purpose.
+    stopChild()
+    await update($, playing, () => null)
+    if (code !== 0 && errors.trim()) $.ui.toast(`Could not play it: ${errors.trim().split('\n').pop()}`)
+  })()
+}
+
+function stopChild() {
+  generation++
+  ticker?.cancel()
+  ticker = null
+  const old = child
+  child = null
+  if (old) void old.return(undefined).catch(() => {})
+}
+
+// ── Recaps ───────────────────────────────────────────────────────────────────
+
+async function noteAgent($: EngineInterface) {
+  await update($, work, w => ({ ...w, agents: w.agents + 1 }))
+}
+
+async function noteFile($: EngineInterface, path: string) {
+  await update($, work, w => (w.files.includes(path) ? w : { ...w, files: [...w.files, path].slice(-200) }))
+}
+
+/** After a main-loop turn: recap a big move once no subagent is still at it. */
+async function afterTurn($: EngineInterface) {
+  if (!isBig(await read($, work))) return
+  // Subagents run in the background; their results wake the main loop for
+  // another turn, which comes back here once they are done.
+  const agents = await $.agent.list().catch(() => [])
+  if (agents.some(a => a.status === 'running' || a.status === 'pending')) return
+  await writeRecap($, false)
+}
+
+async function writeRecap($: EngineInterface, isAsked: boolean) {
+  if (isRecapping) return
+  isRecapping = true
+  await update($, recaps, r => ({ ...r, isWriting: true }))
+  try {
+    const reply = await $.model.fork({ prompt: ASK })
+    if (!reply.isAnswered) {
+      if (reply.reason === 'api-error') $.ui.toast(`${NAME}: the recap could not be written (API error)`)
+      else if (isAsked && reply.reason === 'nothing-to-fork') $.ui.toast(`${NAME}: nothing to recap yet`)
+      return
+    }
+    const note = parse(reply.text, await $.clock.now(), isAsked)
+    await update($, work, () => NO_WORK)
+    const isLooking = (await read($, tab)) === 'recap'
+    await update($, recaps, r => ({ ...r, list: [note, ...r.list].slice(0, KEEP), view: 0, isNew: !isLooking }))
+    if (!isAsked) $.ui.toast(`${NAME}: a recap of that move is in the Recap tab`)
+  } catch {
+    if (isAsked) $.ui.toast(`${NAME}: the recap could not be written`)
+  } finally {
+    isRecapping = false
+    await update($, recaps, r => ({ ...r, isWriting: false }))
+  }
+}
+
+/** After a reload: no recap call survives it. */
+async function resetRecap($: EngineInterface) {
+  isRecapping = false
+  if ((await read($, recaps)).isWriting) await update($, recaps, r => ({ ...r, isWriting: false }))
+}
+
+// ── Local servers ────────────────────────────────────────────────────────────
 
 async function notePlayers($: EngineInterface, text: string, tag: string | null) {
   const urls = [...new Set(text.match(LOCAL_URL) ?? [])].map(url => url.replace(/[.,]+$/, ''))
@@ -639,17 +989,47 @@ async function checkPlayers($: EngineInterface) {
   const list = await read($, players)
   if (list.length === 0) return
   const checked: ReviewPlayer[] = []
-  for (const player of list) {
-    const probe = await $.process.run(['curl', '-s', '-o', '/dev/null', '--max-time', '2', '-w', '%{http_code}', player.url], {
-      timeoutMs: 5000,
-    })
-    checked.push({ ...player, isAlive: probe.stdout.trim() !== '000' && probe.stdout.trim() !== '' })
+  for (const server of list) {
+    checked.push({ ...server, isAlive: await isAnswering($, server.url) })
   }
-  await update($, players, () => checked)
+  // A server removed while the checks ran stays removed.
+  await update($, players, now => now.map(p => checked.find(c => c.url === p.url) ?? p))
 }
 
-async function restart($: EngineInterface, player: ReviewPlayer) {
-  await $.prompt.submit({ text: `The local server ${player.tag ? `for ${player.tag} ` : ''}(${player.url}) has stopped. Restart it.` })
+async function isAnswering($: EngineInterface, url: string): Promise<boolean> {
+  const probe = await $.process.run(['curl', '-s', '-o', '/dev/null', '--max-time', '2', '-w', '%{http_code}', url], { timeoutMs: 5000 })
+  return probe.stdout.trim() !== '000' && probe.stdout.trim() !== ''
+}
+
+// Stops what listens on the server's port: the server Claude started there.
+async function stopServer($: EngineInterface, server: ReviewPlayer) {
+  const port = server.url.match(/^https?:\/\/[^/:]+:(\d+)/)?.[1]
+  if (!port) {
+    $.ui.toast(`${server.url} names no port, so ${NAME} cannot tell which process it is`)
+    return
+  }
+  const found = await $.process.run(['lsof', '-nP', '-t', `-iTCP:${port}`, '-sTCP:LISTEN'], { timeoutMs: 5000 }).catch(() => null)
+  const pids = (found?.stdout ?? '').split('\n').map(s => s.trim()).filter(s => /^\d+$/.test(s))
+  if (pids.length === 0) {
+    $.ui.toast(`Nothing is listening on :${port}`)
+  } else {
+    const names: string[] = []
+    for (const pid of pids) {
+      const ps = await $.process.run(['ps', '-o', 'comm=', '-p', pid], { timeoutMs: 5000 }).catch(() => null)
+      names.push(baseName(ps?.stdout.trim() || pid))
+      await $.process.run(['kill', '-TERM', pid], { timeoutMs: 5000 }).catch(() => null)
+    }
+    $.ui.toast(`Stopped ${[...new Set(names)].join(', ')} on :${port}`)
+  }
+  await update($, players, list => list.map(p => (p.url === server.url ? { ...p, isAlive: false } : p)))
+}
+
+async function restartServer($: EngineInterface, server: ReviewPlayer) {
+  await $.prompt.submit({ text: `The local server ${server.tag ? `for ${server.tag} ` : ''}(${server.url}) has stopped. Restart it.` })
+}
+
+async function dropServer($: EngineInterface, server: ReviewPlayer) {
+  await update($, players, list => list.filter(p => p.url !== server.url))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -712,6 +1092,11 @@ function ago(ms: number): string {
   if (minutes < 60 * 24) return `${Math.round(minutes / 60)}h`
 
   return `${Math.round(minutes / (60 * 24))}d`
+}
+
+function wrote(ms: number): string {
+  const when = ago(ms)
+  return when === 'now' ? 'written just now' : `written ${when} ago`
 }
 
 function clip(text: string, room: number): string {
