@@ -21,6 +21,20 @@ export const ASK = [
   'Do not use any tools.',
 ].join('\n')
 
+/** A bar of `width` cells with a light bouncing along it, at step `step`: ░▒▓█▓▒░. */
+export function scanner(step: number, width: number): string {
+  const span = Math.max(1, width - 1)
+  const at = Math.abs(((step % (2 * span)) + 2 * span) % (2 * span) - span)
+  const head = span - at
+  return Array.from({ length: width }, (_, i) => ['█', '▓', '▒'][Math.abs(i - head)] ?? '░').join('')
+}
+
+/** A spinner frame for step `step`. */
+export function spinner(step: number): string {
+  const frames = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  return frames[((step % frames.length) + frames.length) % frames.length]!
+}
+
 export function isBig(work: Work): boolean {
   return work.agents >= BIG_AGENTS || work.files.length >= BIG_FILES
 }

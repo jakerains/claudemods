@@ -22,7 +22,7 @@ import type { EngineInterface, Register, RenderChildren, Timer } from 'claude-co
 
 import type { Recaps, Related, RelatedGroup, ReviewPlayer, TrayAction, TrayItem, Work } from '../types'
 import { clockText, ffplayArgs, ffprobeArgs, landing, lengthIn, positionOf } from './player'
-import { ASK, BIG_AGENTS, BIG_FILES, KEEP, isBig, parse } from './recap'
+import { ASK, BIG_AGENTS, BIG_FILES, KEEP, isBig, parse, scanner, spinner } from './recap'
 import {
   SHOWN_PATH,
   actionPattern,
@@ -57,7 +57,7 @@ const REFRESH_GAP_MS = 60_000
 const FOLDERS_MS = 60_000
 
 const NO_RELATED: Related = { area: null, label: '', groups: [], actions: [], suggested: [] }
-const NO_RECAPS: Recaps = { list: [], view: 0, isWriting: false, isNew: false, ticked: [] }
+const NO_RECAPS: Recaps = { list: [], view: 0, isWriting: false, startedAt: 0, isNew: false, ticked: [] }
 const NO_WORK: Work = { agents: 0, files: [] }
 
 // Held by the host, so the tray survives a hot reload of this file.
@@ -70,6 +70,7 @@ const hidden = atom({ plugin: 'open-tray', key: 'hidden' } as const, [])
 const tab = atom({ plugin: 'open-tray', key: 'tab' } as const, 'tray')
 const playing = atom({ plugin: 'open-tray', key: 'playing' } as const, null)
 const tick = atom({ plugin: 'open-tray', key: 'tick' } as const, 0)
+const spin = atom({ plugin: 'open-tray', key: 'spin' } as const, 0)
 const recaps = atom({ plugin: 'open-tray', key: 'recaps' } as const, NO_RECAPS)
 const work = atom({ plugin: 'open-tray', key: 'work' } as const, NO_WORK)
 
@@ -95,6 +96,9 @@ let ticker: Timer | null = null
 let hasFfplay: boolean | null = null
 // One recap at a time; a reload ends the call, so a module variable is enough.
 let isRecapping = false
+// Moves the "writing recap" bar while one is written, and only then.
+let spinning: Timer | null = null
+const SPIN_MS = 120
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -266,7 +270,7 @@ export const register: Register = on => {
     if (word === 'recap') await showTab($, 'recap')
     const opened = await $.ui.open({ id: PANE, title: NAME, focus: true })
     if (word === 'recap') {
-      void writeRecap($, true)
+      await writeRecap($, true)
       return { text: opened.isPlaced ? `${NAME}: writing a recap.` : `${NAME} could not be placed; widen the terminal.` }
     }
     const count = (await read($, items)).length
@@ -289,6 +293,8 @@ export const register: Register = on => {
     const rc = await read($, recaps)
     const sound = await read($, playing)
     await read($, tick) // Redraws the player's clock each second while it plays.
+    const step = rc.isWriting ? await read($, spin) : 0 // Moves the recap's bar while it is written.
+    const writingFor = rc.isWriting && rc.startedAt ? `${Math.max(0, Math.round((now - rc.startedAt) / 1000))}s` : ''
 
     const title = (text: string, count?: number) => {
       const tail = count === undefined ? '' : ` ${count}`
@@ -325,7 +331,8 @@ export const register: Register = on => {
         <Text color={THEME.accent}>{showing === 'recap' ? '▸' : ' '}</Text>
         <Button key="tab-recap" plain hotkey="2" dimColor={showing !== 'recap'} label="RECAP" onPress={() => void showTab($, 'recap')} />
         <Text color={THEME.accent}>{rc.isNew ? ' ●' : ''}</Text>
-        <Text color={THEME.faint}>{rc.isWriting ? '  writing…' : ''}</Text>
+        <Text color={THEME.accent}>{rc.isWriting ? `  ${spinner(step)}` : ''}</Text>
+        <Text color={THEME.faint}>{rc.isWriting ? ` writing ${writingFor}` : ''}</Text>
       </Box>
     )
 
@@ -487,9 +494,22 @@ export const register: Register = on => {
     function drawRecap() {
       const shown = rc.list[Math.min(rc.view, rc.list.length - 1)]
       const wide = Math.max(10, columns - 4)
+      const barWidth = Math.max(6, Math.min(24, columns - 30))
+      const writing = rc.isWriting && (
+        <Box flexDirection="column" borderStyle="round" borderColor={THEME.accent} paddingX={1} marginTop={1} width={columns}>
+          <Box flexDirection="row" justifyContent="space-between" width={Math.max(10, columns - 4)}>
+            <Box flexDirection="row">
+              <Text bold color={THEME.chrome}>{'WRITING RECAP  '}</Text>
+              <Text color={THEME.accent}>{scanner(step, barWidth)}</Text>
+            </Box>
+            <Text color={THEME.sub}>{writingFor}</Text>
+          </Box>
+          <Text color={THEME.faint} wrap="wrap">{'Reading back over our conversation for what we did, what waits on you and what comes next.'}</Text>
+        </Box>
+      )
       const footer = (
         <Box flexDirection="row" flexWrap="wrap" marginTop={1}>
-          <Button key="recap-now" plain hotkey="r" label="recap now   " onPress={() => void writeRecap($, true)} />
+          <Button key="recap-now" plain hotkey="r" label="recap now   " onPress={() => writeRecap($, true)} />
           {rc.view < rc.list.length - 1 && (
             <Button key="older" plain label="◂ older   " onPress={() => void update($, recaps, x => ({ ...x, view: x.view + 1 }))} />
           )}
@@ -503,17 +523,23 @@ export const register: Register = on => {
       )
       if (!shown) {
         return (
-          <Box flexDirection="column" marginTop={1} paddingX={1} width={columns}>
-            <Text color={THEME.sub}>{rc.isWriting ? 'Writing the recap…' : 'No recap yet.'}</Text>
-            <Text color={THEME.faint} wrap="wrap">
-              {`One writes itself after a big move (${BIG_AGENTS}+ subagents or ${BIG_FILES}+ files changed): what we did, what waits on you, and what comes next.`}
-            </Text>
+          <Box flexDirection="column" width={columns}>
+            {writing}
+            {!rc.isWriting && (
+              <Box flexDirection="column" marginTop={1} paddingX={1} width={columns}>
+                <Text color={THEME.sub}>{'No recap yet.'}</Text>
+                <Text color={THEME.faint} wrap="wrap">
+                  {`One writes itself after a big move (${BIG_AGENTS}+ subagents or ${BIG_FILES}+ files changed): what we did, what waits on you, and what comes next.`}
+                </Text>
+              </Box>
+            )}
             {footer}
           </Box>
         )
       }
       return (
         <Box flexDirection="column" width={columns}>
+          {writing}
           {title('What we did')}
           {shown.did.map(text => (
             <Box flexDirection="row">
@@ -936,10 +962,18 @@ async function afterTurn($: EngineInterface) {
   await writeRecap($, false)
 }
 
+// Shows "writing" at once, then writes the recap on a timer of its own: a
+// press or a command answers right away, so the pane draws the bar first.
 async function writeRecap($: EngineInterface, isAsked: boolean) {
   if (isRecapping) return
   isRecapping = true
-  await update($, recaps, r => ({ ...r, isWriting: true }))
+  const now = await $.clock.now()
+  await update($, recaps, r => ({ ...r, isWriting: true, startedAt: now }))
+  if (!spinning) spinning = $.clock.every(SPIN_MS, () => void update($, spin, n => n + 1))
+  $.clock.after(0, () => void forkRecap($, isAsked))
+}
+
+async function forkRecap($: EngineInterface, isAsked: boolean) {
   try {
     const reply = await $.model.fork({ prompt: ASK })
     if (!reply.isAnswered) {
@@ -956,14 +990,17 @@ async function writeRecap($: EngineInterface, isAsked: boolean) {
     if (isAsked) $.ui.toast(`${NAME}: the recap could not be written`)
   } finally {
     isRecapping = false
-    await update($, recaps, r => ({ ...r, isWriting: false }))
+    spinning?.cancel()
+    spinning = null
+    await update($, recaps, r => ({ ...r, isWriting: false, startedAt: 0 }))
   }
 }
 
 /** After a reload: no recap call survives it. */
 async function resetRecap($: EngineInterface) {
   isRecapping = false
-  if ((await read($, recaps)).isWriting) await update($, recaps, r => ({ ...r, isWriting: false }))
+  spinning = null
+  if ((await read($, recaps)).isWriting) await update($, recaps, r => ({ ...r, isWriting: false, startedAt: 0 }))
 }
 
 // ── Local servers ────────────────────────────────────────────────────────────

@@ -60,6 +60,8 @@ export type Recaps = {
   /** Which recap the tab shows: an index into list. */
   view: number
   isWriting: boolean
+  /** When the recap being written was started; 0 when none is. */
+  startedAt: number
   /** A recap the person has not looked at yet. */
   isNew: boolean
   /** Ticked to-dos, as "<recap at>:<index>". */
@@ -86,6 +88,8 @@ declare module 'claude-code' {
       playing: NowPlaying | null
       /** Ticks once a second while something plays, so the pane redraws its clock. */
       tick: number
+      /** Steps the "writing recap" bar has moved: ticks only while one is written. */
+      spin: number
       recaps: Recaps
       work: Work
     }

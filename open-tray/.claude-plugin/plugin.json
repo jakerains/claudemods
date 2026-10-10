@@ -1,6 +1,6 @@
 {
   "name": "open-tray",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "POWERTRAY: a pane of things to look at or listen to (what Claude made this session, things related to what you are on, local servers), a player for a film's sound, and a plain-words recap of big moves. Project rules in .claude/tray.json or ~/.claude/open-tray/rules/.",
   "author": {
     "name": "Jake Rains"
