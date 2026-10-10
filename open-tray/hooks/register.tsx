@@ -9,8 +9,9 @@
 //   how to spot its areas and where their good stuff lives (rules.ts); without
 //   one, the area is the folder Claude works in, or one a prompt names.
 // - Local servers Claude started, each with stop, restart and remove.
-// Recap (recap.ts): after a big move, what we did, what waits on the person,
-// and what comes next.
+// Recap (recap.ts): what we did, what waits on the person, and what comes
+// next. A quick one (Haiku) after each stretch of work; a detailed one (the
+// session's model) on request.
 // A player card (player.ts) shows above both while a film's sound or an audio
 // file plays.
 //
@@ -22,7 +23,7 @@ import type { EngineInterface, Register, RenderChildren, Timer } from 'claude-co
 
 import type { Recaps, Related, RelatedGroup, ReviewPlayer, TrayAction, TrayItem, Work } from '../types'
 import { clockText, ffplayArgs, ffprobeArgs, landing, lengthIn, positionOf } from './player'
-import { ASK, BIG_AGENTS, BIG_FILES, KEEP, isBig, parse, scanner, spinner } from './recap'
+import { ASK, KEEP, QUICK_MODEL, QUICK_SYSTEM, RECAP_FILES, digest, isWorth, parse, progress, quickAsk, scanner, spinner } from './recap'
 import {
   SHOWN_PATH,
   actionPattern,
@@ -57,8 +58,8 @@ const REFRESH_GAP_MS = 60_000
 const FOLDERS_MS = 60_000
 
 const NO_RELATED: Related = { area: null, label: '', groups: [], actions: [], suggested: [] }
-const NO_RECAPS: Recaps = { list: [], view: 0, isWriting: false, startedAt: 0, isNew: false, ticked: [] }
-const NO_WORK: Work = { agents: 0, files: [] }
+const NO_RECAPS: Recaps = { list: [], view: 0, isWriting: false, isDetailed: false, startedAt: 0, isNew: false, ticked: [], note: '' }
+const NO_WORK: Work = { agents: 0, files: [], calls: 0 }
 
 // Held by the host, so the tray survives a hot reload of this file.
 const items = atom({ plugin: 'open-tray', key: 'items' } as const, [])
@@ -73,6 +74,7 @@ const tick = atom({ plugin: 'open-tray', key: 'tick' } as const, 0)
 const spin = atom({ plugin: 'open-tray', key: 'spin' } as const, 0)
 const recaps = atom({ plugin: 'open-tray', key: 'recaps' } as const, NO_RECAPS)
 const work = atom({ plugin: 'open-tray', key: 'work' } as const, NO_WORK)
+const autoRecap = atom({ plugin: 'open-tray', key: 'autoRecap' } as const, true)
 
 const LOCAL_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|[\w.-]+\.localhost)(?::\d+)?(?:\/[^\s'"`)\]<>]*)?/g
 const OUTPUT_FILE = /\/[^\s'"`]+\/tasks\/[\w-]+\.output\b/
@@ -96,6 +98,8 @@ let ticker: Timer | null = null
 let hasFfplay: boolean | null = null
 // One recap at a time; a reload ends the call, so a module variable is enough.
 let isRecapping = false
+// "Recap now" pressed while a quick one was being written: the detailed one follows it.
+let wantDetailed = false
 // Moves the "writing recap" bar while one is written, and only then.
 let spinning: Timer | null = null
 const SPIN_MS = 120
@@ -107,10 +111,12 @@ export const register: Register = on => {
     rules = await loadRules($, root)
     await resetPlayer($)
     await resetRecap($)
+    const isAuto = (await $.store.get('autoRecap').catch(() => undefined)) !== false
+    await update($, autoRecap, () => isAuto)
     await $.command.register({
       name: 'tray',
-      description: `Show ${NAME}: what was made for you this session, things related to what we are on, and a recap of big moves (recap: write one now; trust: use this repo's .claude/tray.json)`,
-      argumentHint: '[recap|trust|untrust]',
+      description: `Show ${NAME}: what was made for you this session, things related to what we are on, and a recap of the work (recap: write a detailed one now; autorecap on|off: quick recaps on their own; trust: use this repo's .claude/tray.json)`,
+      argumentHint: '[recap|autorecap [on|off]|trust|untrust]',
       immediate: true,
     })
     await $.tool.register({
@@ -176,6 +182,7 @@ export const register: Register = on => {
     }
     const input = e as unknown as Record<string, unknown>
     const isMain = !e.agentId
+    if (isMain) await noteCall($)
 
     const path = String(input.file_path ?? input.path ?? input.notebook_path ?? '')
     if (path.startsWith('/')) {
@@ -185,7 +192,7 @@ export const register: Register = on => {
         const area = areaIn(path, rules) ?? (rules?.areas?.length ? null : folderArea(path, root, current))
         if (area) await vote($, area, false)
       }
-      // Changed files, anyone's, make a stretch a big move; a shown file Claude writes lands.
+      // Changed files, anyone's, make a stretch worth a recap; a shown file Claude writes lands.
       if (EDIT_TOOLS.has(e.tool)) await noteFile($, path)
       if (e.tool === 'Write' && isShown(path)) {
         const item = await itemFor($, path)
@@ -241,7 +248,7 @@ export const register: Register = on => {
   })
 
   // New renders land during a turn; look again once it ends (at most once a
-  // minute). A big move gets its recap, off the hook's own time.
+  // minute). A stretch of work gets its quick recap, off the hook's own time.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId) return result
@@ -265,8 +272,9 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'tray' }, async ($, e) => {
-    const word = e.args.trim().toLowerCase()
+    const [word = '', choice] = e.args.trim().toLowerCase().split(/\s+/)
     if (word === 'trust' || word === 'untrust') return { text: await trustRepo($, word === 'trust') }
+    if (word === 'autorecap') return { text: await setAutoRecap($, choice) }
     if (word === 'recap') await showTab($, 'recap')
     const opened = await $.ui.open({ id: PANE, title: NAME, focus: true })
     if (word === 'recap') {
@@ -291,6 +299,8 @@ export const register: Register = on => {
     const r = await read($, related)
     const showing = await read($, tab)
     const rc = await read($, recaps)
+    const done = await read($, work)
+    const isAuto = await read($, autoRecap)
     const sound = await read($, playing)
     await read($, tick) // Redraws the player's clock each second while it plays.
     const step = rc.isWriting ? await read($, spin) : 0 // Moves the recap's bar while it is written.
@@ -504,7 +514,11 @@ export const register: Register = on => {
             </Box>
             <Text color={THEME.sub}>{writingFor}</Text>
           </Box>
-          <Text color={THEME.faint} wrap="wrap">{'Reading back over our conversation for what we did, what waits on you and what comes next.'}</Text>
+          <Text color={THEME.faint} wrap="wrap">
+            {rc.isDetailed
+              ? 'Detailed, on the session model: reading back over our conversation for what we did, what waits on you and what comes next.'
+              : 'Quick, on Haiku: reading the latest stretch of work. Press r for a detailed one.'}
+          </Text>
         </Box>
       )
       const footer = (
@@ -517,8 +531,16 @@ export const register: Register = on => {
             <Button key="newer" plain label="newer ▸   " onPress={() => void update($, recaps, x => ({ ...x, view: x.view - 1 }))} />
           )}
           {shown && (
-            <Text color={THEME.faint}>{`${wrote(now - shown.at)} · ${shown.isAsked ? 'asked for' : 'after a big move'}`}</Text>
+            <Text color={THEME.faint}>{`${wrote(now - shown.at)} · ${shown.isAsked ? 'detailed' : 'quick (Haiku)'}`}</Text>
           )}
+        </Box>
+      )
+      const status = !rc.isWriting && (
+        <Box flexDirection="column" paddingX={1} width={columns}>
+          <Text color={THEME.faint} wrap="wrap">
+            {isAuto ? progress(done) : 'Quick recaps are off (/tray autorecap on). Press r for a detailed one.'}
+          </Text>
+          {isAuto && rc.note && <Text color={THEME.stop} wrap="wrap">{rc.note}</Text>}
         </Box>
       )
       if (!shown) {
@@ -529,11 +551,12 @@ export const register: Register = on => {
               <Box flexDirection="column" marginTop={1} paddingX={1} width={columns}>
                 <Text color={THEME.sub}>{'No recap yet.'}</Text>
                 <Text color={THEME.faint} wrap="wrap">
-                  {`One writes itself after a big move (${BIG_AGENTS}+ subagents or ${BIG_FILES}+ files changed): what we did, what waits on you, and what comes next.`}
+                  {`A quick one writes itself after a stretch of work (a subagent, ${RECAP_FILES}+ files changed, or a run of steps): what we did, what waits on you, and what comes next. Press r for a detailed one.`}
                 </Text>
               </Box>
             )}
             {footer}
+            {status}
           </Box>
         )
       }
@@ -572,6 +595,7 @@ export const register: Register = on => {
             </Box>
           )}
           {footer}
+          {status}
         </Box>
       )
     }
@@ -948,57 +972,109 @@ async function noteAgent($: EngineInterface) {
   await update($, work, w => ({ ...w, agents: w.agents + 1 }))
 }
 
+async function noteCall($: EngineInterface) {
+  await update($, work, w => ({ ...w, calls: (w.calls ?? 0) + 1 }))
+}
+
 async function noteFile($: EngineInterface, path: string) {
   await update($, work, w => (w.files.includes(path) ? w : { ...w, files: [...w.files, path].slice(-200) }))
 }
 
-/** After a main-loop turn: recap a big move once no subagent is still at it. */
+/** After a main-loop turn: a quick recap of the work, once no subagent is still at it. */
 async function afterTurn($: EngineInterface) {
-  if (!isBig(await read($, work))) return
+  if (!(await read($, autoRecap))) return
+  if (!isWorth(await read($, work))) return
   // Subagents run in the background; their results wake the main loop for
   // another turn, which comes back here once they are done.
   const agents = await $.agent.list().catch(() => [])
-  if (agents.some(a => a.status === 'running' || a.status === 'pending')) return
+  const busy = agents.filter(a => a.status === 'running' || a.status === 'pending').length
+  if (busy > 0) {
+    await update($, recaps, r => ({ ...r, note: `Waiting for ${busy} subagent${busy === 1 ? '' : 's'} to finish.` }))
+    return
+  }
   await writeRecap($, false)
 }
 
 // Shows "writing" at once, then writes the recap on a timer of its own: a
 // press or a command answers right away, so the pane draws the bar first.
+// Asked for: detailed, on the session's model. On its own: quick, on Haiku.
 async function writeRecap($: EngineInterface, isAsked: boolean) {
-  if (isRecapping) return
+  if (isRecapping) {
+    if (isAsked && !(await read($, recaps)).isDetailed) wantDetailed = true
+    return
+  }
   isRecapping = true
   const now = await $.clock.now()
-  await update($, recaps, r => ({ ...r, isWriting: true, startedAt: now }))
+  await update($, recaps, r => ({ ...r, isWriting: true, isDetailed: isAsked, startedAt: now }))
   if (!spinning) spinning = $.clock.every(SPIN_MS, () => void update($, spin, n => n + 1))
-  $.clock.after(0, () => void forkRecap($, isAsked))
+  $.clock.after(0, () => void runRecap($, isAsked))
 }
 
-async function forkRecap($: EngineInterface, isAsked: boolean) {
+/** The detailed recap forks the session; the quick one hands Haiku a cut of the transcript. */
+async function askRecap($: EngineInterface, isAsked: boolean) {
+  if (isAsked) return $.model.fork({ prompt: ASK })
+  const transcript = digest(await $.session.messages())
+  if (!transcript) return null
+  const last = (await read($, recaps)).list[0]
+  return $.model.complete({
+    model: QUICK_MODEL,
+    system: QUICK_SYSTEM,
+    prompt: quickAsk(transcript, last),
+    maxTokens: 1024,
+    effort: 'low',
+    timeoutMs: 90_000,
+  })
+}
+
+async function runRecap($: EngineInterface, isAsked: boolean) {
   try {
-    const reply = await $.model.fork({ prompt: ASK })
-    if (!reply.isAnswered) {
-      if (reply.reason === 'api-error') $.ui.toast(`${NAME}: the recap could not be written (API error)`)
-      else if (isAsked && reply.reason === 'nothing-to-fork') $.ui.toast(`${NAME}: nothing to recap yet`)
+    const reply = await askRecap($, isAsked)
+    if (!reply?.isAnswered) {
+      if (isAsked && reply?.reason === 'api-error') $.ui.toast(`${NAME}: the recap could not be written (API error)`)
+      else if (isAsked && reply?.reason === 'nothing-to-fork') $.ui.toast(`${NAME}: nothing to recap yet`)
+      if (!isAsked) {
+        const why = !reply ? 'no transcript yet' : reply.reason === 'api-error' ? `API error ${reply.status ?? ''} ${reply.error}`.replace(/\s+/g, ' ') : reply.reason
+        await update($, recaps, r => ({ ...r, note: `The last quick recap did not come: ${why}.` }))
+      }
       return
     }
     const note = parse(reply.text, await $.clock.now(), isAsked)
     await update($, work, () => NO_WORK)
     const isLooking = (await read($, tab)) === 'recap'
-    await update($, recaps, r => ({ ...r, list: [note, ...r.list].slice(0, KEEP), view: 0, isNew: !isLooking }))
-    if (!isAsked) $.ui.toast(`${NAME}: a recap of that move is in the Recap tab`)
-  } catch {
+    await update($, recaps, r => ({ ...r, list: [note, ...r.list].slice(0, KEEP), view: 0, isNew: !isLooking, note: '' }))
+  } catch (error) {
     if (isAsked) $.ui.toast(`${NAME}: the recap could not be written`)
+    else {
+      const why = String(error instanceof Error ? error.message : error).slice(0, 160)
+      await update($, recaps, r => ({ ...r, note: `The last quick recap did not come: ${why}` }))
+    }
   } finally {
     isRecapping = false
     spinning?.cancel()
     spinning = null
-    await update($, recaps, r => ({ ...r, isWriting: false, startedAt: 0 }))
+    await update($, recaps, r => ({ ...r, isWriting: false, isDetailed: false, startedAt: 0 }))
+    if (wantDetailed) {
+      wantDetailed = false
+      await writeRecap($, true)
+    }
   }
+}
+
+/** `/tray autorecap [on|off]`: on its own, it flips. Kept for every session. */
+async function setAutoRecap($: EngineInterface, choice: string | undefined): Promise<string> {
+  if (choice !== undefined && choice !== 'on' && choice !== 'off') return `${NAME}: /tray autorecap on, or off`
+  const isOn = choice === undefined ? !(await read($, autoRecap)) : choice === 'on'
+  await update($, autoRecap, () => isOn)
+  await $.store.set('autoRecap', isOn)
+  return isOn
+    ? `${NAME}: quick recaps (Haiku) write themselves again after a stretch of work.`
+    : `${NAME}: quick recaps are off; press r in the Recap tab, or /tray recap, for a detailed one.`
 }
 
 /** After a reload: no recap call survives it. */
 async function resetRecap($: EngineInterface) {
   isRecapping = false
+  wantDetailed = false
   spinning = null
   if ((await read($, recaps)).isWriting) await update($, recaps, r => ({ ...r, isWriting: false, startedAt: 0 }))
 }

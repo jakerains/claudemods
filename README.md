@@ -65,8 +65,9 @@ the prompt with other mods. [More →](prompt-cache-control/README.md)
 A pane (`/tray`) of things to look at or listen to while you work: what Claude
 made or opened this session, things related to the area you're in, and local dev
 servers you can stop or restart. `a` plays a film's sound right in the tray. A
-Recap tab says, after a big move, what was done, what waits on you and what
-comes next. macOS. [More →](open-tray/README.md)
+Recap tab says what was done, what waits on you and what comes next: a quick
+one by Haiku after each stretch of work (`/tray autorecap off` to stop it), a
+detailed one by the session's model when you ask. macOS. [More →](open-tray/README.md)
 
 ## Develop
 

@@ -37,6 +37,8 @@ function engine(
     folders?: string
     spawned?: string[][]
     forks?: string[]
+    completes?: { model: string; prompt: string }[]
+    quickRefused?: boolean
     agents?: { status: string }[]
   },
 ) {
@@ -113,6 +115,25 @@ function engine(
       },
     }
   })
+  // Haiku answers five seconds later, so a test can press while it writes.
+  on('model.complete', async ($: any, e: any) => {
+    opts.completes?.push({ model: e.model, prompt: String(e.prompt) })
+    if (opts.quickRefused) return { value: { isAnswered: false, reason: 'api-error', status: 400, error: 'invalid_request' } }
+    await clock.sleep(5000)
+    return {
+      value: {
+        isAnswered: true,
+        text: '{"did": ["Changed three files"], "waiting": [], "next": "Test it"}',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    }
+  })
+  on('session.messages', () => ({
+    value: [
+      { role: 'user', text: 'make the player quieter', toolUses: [] },
+      { role: 'assistant', text: 'On it.', toolUses: [{ tool_use_id: 'u1', tool: 'Edit', input: { file_path: '/w/src/f0.ts' } }] },
+    ],
+  }))
   on('agent.list', () => ({ value: opts.agents ?? [] }))
   on('turn.complete', () => ({ text: '' }))
   on('ui.close', () => ({ value: undefined }))
@@ -400,48 +421,123 @@ describe('open-tray', () => {
     await ui.unmount()
   })
 
-  test('after a big move, once no subagent is at it, the Recap tab says what we did, what waits on you, and what is next', async ($, on) => {
+  test('after a stretch of work, once no subagent is at it, Haiku writes a quick recap; "recap now" writes a detailed one on the session model', async ($, on) => {
     const forks: string[] = []
+    const completes: { model: string; prompt: string }[] = []
     const agents = [{ status: 'running' }]
-    const clock = engine(on, { rules: null, forks, agents })
+    const clock = engine(on, { rules: null, forks, completes, agents })
     await start($)
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 3; i++) {
       await $.tool.call({ tool: 'Edit', file_path: `/w/src/f${i}.ts`, old_string: 'a', new_string: 'b', agentId: 'sub-1' } as any)
     }
     await turnEnds($)
-    await clock.settle()
-    expect(forks.length).toBe(0)
+    await clock.advance(5000)
+    expect(completes.length).toBe(0)
 
     agents.length = 0
     await turnEnds($)
     await clock.settle()
-    expect(forks.length).toBe(1)
-
     const ui = await $.ui.mount(PANE)
+    await clock.advance(5000)
+    expect(completes.length).toBe(1)
+    expect(forks.length).toBe(0)
+    expect(completes[0]!.model).toBe('haiku')
+    expect(completes[0]!.prompt).toContain('PERSON: make the player quieter')
+    expect(completes[0]!.prompt).toContain('[Edit] /w/src/f0.ts')
+
     expect(await ui.find({ type: 'Text', text: /^ ●$/ })).toBeDefined()
     await ui.press({ key: 'tab-recap' })
     expect(await ui.find({ type: 'Text', text: /^ ●$/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /^WHAT WE DID$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Changed three files$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /quick \(Haiku\)$/ })).toBeDefined()
+
+    // A turn with no work after it writes nothing.
+    await turnEnds($)
+    await clock.advance(5000)
+    expect(completes.length).toBe(1)
+
+    // "Recap now": detailed, from the session's own conversation.
+    await ui.press({ key: 'recap-now' })
+    expect(await ui.find({ type: 'Text', text: /^WRITING RECAP/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Detailed, on the session model/ })).toBeDefined()
+    await clock.settle()
+    expect(forks.length).toBe(1)
+    expect(await ui.find({ type: 'Text', text: /^WRITING RECAP/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /^Built the player$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^Try it on a real film$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^Phase 2: the recap$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /detailed$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: /older/ })).toBeDefined()
 
     await ui.press({ key: 'todo-0' })
     expect(await ui.find({ type: 'Button', text: /\[x\]/ })).toBeDefined()
 
-    // A small turn after it writes nothing; "recap now" always does.
+    // Pressed while a quick one is being written: the detailed one follows it.
+    for (let i = 3; i < 6; i++) {
+      await $.tool.call({ tool: 'Edit', file_path: `/w/src/f${i}.ts`, old_string: 'a', new_string: 'b' } as any)
+    }
     await turnEnds($)
     await clock.settle()
-    expect(forks.length).toBe(1)
+    expect(await ui.find({ type: 'Text', text: /^Quick, on Haiku/ })).toBeDefined()
     await ui.press({ key: 'recap-now' })
-    expect(await ui.find({ type: 'Text', text: /^WRITING RECAP/ })).toBeDefined()
-    await clock.settle()
+    await clock.advance(5000)
+    expect(completes.length).toBe(2)
     expect(forks.length).toBe(2)
+    expect(completes[1]!.prompt).toContain('<last_recap>')
     expect(await ui.find({ type: 'Text', text: /^WRITING RECAP/ })).toBeUndefined()
-    expect(await ui.find({ type: 'Button', text: /older/ })).toBeDefined()
     await ui.unmount()
   })
 
+
+  test('a run of Bash steps earns a quick recap too, and one that did not come says why', async ($, on) => {
+    const completes: { model: string; prompt: string }[] = []
+    const clock = engine(on, { rules: null, completes, quickRefused: true })
+    await start($)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'tab-recap' })
+    expect(await ui.find({ type: 'Text', text: /^Next quick recap: 0\/3 files, 0\/12 steps/ })).toBeDefined()
+    for (let i = 0; i < 12; i++) await $.tool.call({ tool: 'Bash', command: `sed -i '' s/a/b/ f${i}.ts` } as any)
+    expect(await ui.find({ type: 'Text', text: /12\/12 steps/ })).toBeDefined()
+    await turnEnds($)
+    await clock.advance(5000)
+    expect(completes.length).toBe(1)
+    expect(await ui.find({ type: 'Text', text: /^The last quick recap did not come: API error 400 invalid_request\.$/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('/tray autorecap off leaves only the detailed recap; on brings the quick one back, and the choice is kept', async ($, on) => {
+    const forks: string[] = []
+    const completes: { model: string; prompt: string }[] = []
+    const clock = engine(on, { rules: null, forks, completes })
+    await start($)
+    const off = await $.command.run({ command: 'tray', args: 'autorecap off' } as any)
+    expect(String((off as any).text)).toMatch(/quick recaps are off/)
+    for (let i = 0; i < 3; i++) await $.tool.call({ tool: 'Edit', file_path: `/w/src/f${i}.ts`, old_string: 'a', new_string: 'b' } as any)
+    await turnEnds($)
+    await clock.advance(5000)
+    expect(completes.length).toBe(0)
+
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'tab-recap' })
+    expect(await ui.find({ type: 'Text', text: /^Quick recaps are off/ })).toBeDefined()
+    await ui.press({ key: 'recap-now' })
+    await clock.settle()
+    expect(forks.length).toBe(1)
+
+    // Kept across sessions: a new start reads it back.
+    await start($)
+    for (let i = 3; i < 6; i++) await $.tool.call({ tool: 'Edit', file_path: `/w/src/f${i}.ts`, old_string: 'a', new_string: 'b' } as any)
+    await turnEnds($)
+    await clock.advance(5000)
+    expect(completes.length).toBe(0)
+
+    await $.command.run({ command: 'tray', args: 'autorecap' } as any)
+    await turnEnds($)
+    await clock.advance(5000)
+    expect(completes.length).toBe(1)
+    await ui.unmount()
+  })
 })
 
 describe('untrusted rules', () => {

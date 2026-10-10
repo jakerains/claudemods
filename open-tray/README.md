@@ -2,7 +2,7 @@
 
 A Claude Code mod: a pane (`/tray`) of things to look at or listen to while
 you work, so you never have to ask Claude to "open that in Finder" again, and
-a recap of what a big move did and what comes next. The plugin is still
+a recap of what we did and what comes next. The plugin is still
 `open-tray`; POWERTRAY is what the pane is called.
 
 ## Tray tab (`1`)
@@ -31,19 +31,28 @@ play/pause, −1m, −10s, +10s, +1m and stop. Closing the pane stops it.
 
 ## Recap tab (`2`)
 
-After a big move (2+ subagents, or 8+ files changed since the last recap),
-once no subagent is still running, the tray writes a short recap in plain
-words:
+A short recap in plain words:
 
 - **What we did**
 - **Waiting on you**: what you have to do before work can go on (review,
   test, decide), with boxes to tick
 - **Next up**: the next step or phase by the plan you talked through
 
-A dot on the tab means a new one. `r` (recap now) or `/tray recap` writes one
-whenever you like; the last five are kept (◂ older / newer ▸). The recap is
-one extra model call over the session's own conversation, mostly read from
-the prompt cache.
+Two kinds:
+
+- **Quick**, on its own after a stretch of work since the last recap (a
+  subagent, 3+ files changed, or 12+ steps, which catches edits made through
+  Bash), once no subagent is still running. Haiku writes it from the recent
+  transcript and the last recap, so it is cheap enough to run often. A dot on
+  the tab means a new one; the tab shows how close the next one is, and why
+  the last one did not come if it did not. `/tray autorecap off` turns these
+  off (`on` brings them back, bare `/tray autorecap` flips it); the choice is
+  kept for every session.
+- **Detailed**, when you ask: `r` (recap now) or `/tray recap`. The session's
+  own model writes it over the whole conversation (one extra call, mostly read
+  from the prompt cache).
+
+The last five are kept (◂ older / newer ▸).
 
 ## Teaching it your project
 

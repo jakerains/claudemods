@@ -50,7 +50,7 @@ export type Recap = {
   /** What the person has to do before the work can go on. */
   waiting: string[]
   next: string
-  /** Asked for with "recap now", rather than written after a big move. */
+  /** Asked for with "recap now": detailed, on the session's model. Else quick, on Haiku, after a stretch of work. */
   isAsked: boolean
 }
 
@@ -60,18 +60,24 @@ export type Recaps = {
   /** Which recap the tab shows: an index into list. */
   view: number
   isWriting: boolean
+  /** The one being written is the detailed one. */
+  isDetailed: boolean
   /** When the recap being written was started; 0 when none is. */
   startedAt: number
   /** A recap the person has not looked at yet. */
   isNew: boolean
   /** Ticked to-dos, as "<recap at>:<index>". */
   ticked: string[]
+  /** Why the last quick recap did not come, or is waiting; '' when it came. */
+  note: string
 }
 
-/** The work since the last recap: what makes a stretch a big move. */
+/** The work since the last recap: what makes a stretch worth one. */
 export type Work = {
   agents: number
   files: string[]
+  /** Main-loop tool calls. */
+  calls: number
 }
 
 declare module 'claude-code' {
@@ -92,6 +98,8 @@ declare module 'claude-code' {
       spin: number
       recaps: Recaps
       work: Work
+      /** Quick recaps write themselves (Haiku); off, only "recap now" writes one. Kept in $.store. */
+      autoRecap: boolean
     }
   }
 }
